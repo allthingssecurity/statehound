@@ -5,8 +5,10 @@
 #   scripts/install.sh [--prefix DIR] [--claude] [--codex] [--pipeline CHECKOUT]
 #
 #   --prefix DIR         install the binaries into DIR (default: ~/.local/bin)
-#   --claude             install the statehound skill for Claude Code (~/.claude/skills/statehound)
-#   --codex              install the statehound skill for Codex (~/.codex/skills/statehound)
+#   --claude             install the statehound skill for Claude Code (~/.claude/skills/statehound,
+#                        or $CLAUDE_CONFIG_DIR/skills when that is set)
+#   --codex              install the statehound skill for Codex (~/.codex/skills/statehound,
+#                        or $CODEX_HOME/skills when that is set)
 #   --pipeline CHECKOUT  also patch a checkout of the TLA+ bug-finding pipeline
 #                        (github.com/specular-org/Specular at the pinned commit) to use Statehound
 set -euo pipefail
@@ -60,17 +62,20 @@ for bin in statehound tla-cfa; do
     fi
 done
 
+# the configuration directory each tool reads (a profile set with CLAUDE_CONFIG_DIR / CODEX_HOME)
 if $CLAUDE; then
-    mkdir -p "$HOME/.claude/skills"
-    rm -rf "$HOME/.claude/skills/statehound"
-    cp -R "$REPO/skills/statehound" "$HOME/.claude/skills/statehound"
-    echo "==> skill installed for Claude Code: ~/.claude/skills/statehound"
+    dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
+    mkdir -p "$dir"
+    rm -rf "$dir/statehound"
+    cp -R "$REPO/skills/statehound" "$dir/statehound"
+    echo "==> skill installed for Claude Code: $dir/statehound"
 fi
 if $CODEX; then
-    mkdir -p "$HOME/.codex/skills"
-    rm -rf "$HOME/.codex/skills/statehound"
-    cp -R "$REPO/skills/statehound" "$HOME/.codex/skills/statehound"
-    echo "==> skill installed for Codex: ~/.codex/skills/statehound"
+    dir="${CODEX_HOME:-$HOME/.codex}/skills"
+    mkdir -p "$dir"
+    rm -rf "$dir/statehound"
+    cp -R "$REPO/skills/statehound" "$dir/statehound"
+    echo "==> skill installed for Codex: $dir/statehound"
 fi
 
 if [ -n "$PIPELINE" ]; then

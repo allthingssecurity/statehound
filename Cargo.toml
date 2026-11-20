@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/statehound"]
+# scripts/install.sh builds the everystate engine below target/build: not part of this workspace
+exclude = ["target"]
 
 [workspace.package]
 edition = "2021"
