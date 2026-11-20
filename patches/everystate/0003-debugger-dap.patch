@@ -1,0 +1,2332 @@
+diff --git a/src/checker.rs b/src/checker.rs
+index 6322c13..b0c17c6 100644
+--- a/src/checker.rs
++++ b/src/checker.rs
+@@ -436,7 +436,8 @@ impl<'a> Checker<'a> {
+             outdeg: vec![],
+             cur_level: 0,
+             empty: StateData::blank(0),
+-            plans: if crate::compile::enabled() { Some(crate::compile::compile(model)) } else { None },
++            // (the debugger needs the tree-walker: its frames are the expressions it evaluates)
++            plans: if crate::compile::enabled() && !ev.dbg.get() { Some(crate::compile::compile(model)) } else { None },
+             flat: !classic_engine()
+                 && !opts_record
+                 && model.constraints.is_empty()
+@@ -843,7 +844,12 @@ impl<'a> Checker<'a> {
+         if m.inits.is_empty() {
+             return None;
+         }
+-        let found = match self.enumerate_init() {
++        #[cfg(not(target_arch = "wasm32"))]
++        let dbg_frame = if self.ev.dbg.get() { Some(crate::dap::NextGuard::init(self.ev)) } else { None };
++        let found = self.enumerate_init();
++        #[cfg(not(target_arch = "wasm32"))]
++        drop(dbg_frame);
++        let found = match found {
+             Ok(f) => f,
+             Err(e) => {
+                 return Some(match *e {
+@@ -1107,7 +1113,11 @@ impl<'a> Checker<'a> {
+             succs.clear();
+             succ_act.clear();
+             rows.clear();
++            #[cfg(not(target_arch = "wasm32"))]
++            let dbg_frame = if ev.dbg.get() { Some(crate::dap::NextGuard::new(ev, self.trace_to(sid))) } else { None };
+             let generated = if flat { self.successors_flat(&s, &mut rows, &mut succ_act) } else { self.successors(&s, &mut succs, &mut succ_act) };
++            #[cfg(not(target_arch = "wasm32"))]
++            drop(dbg_frame);
+             if let Err(e) = generated {
+                 return match *e {
+                     Fail::Check { status, message } => {
+@@ -1130,6 +1140,10 @@ impl<'a> Checker<'a> {
+             }
+             for i in 0..succ_act.len() {
+                 let ai = succ_act[i] as usize;
++                #[cfg(not(target_arch = "wasm32"))]
++                if ev.dbg.get() {
++                    crate::dap::successor(ai);
++                }
+                 self.generated += 1;
+                 ev.stats.generated.set(self.generated as i64);
+                 let mut known_fp: Option<u64> = None;
+diff --git a/src/cli.rs b/src/cli.rs
+index 5cd7ee7..431670d 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -403,6 +403,8 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+     let mut sim = crate::simulate::SimArgs::default();
+     let mut dump_traces: Vec<crate::tracefile::DumpTrace> = vec![];
+     let mut load_trace: Option<String> = None;
++    // -debugger [options]: Some(the option list, if one follows)
++    let mut debugger: Option<Option<String>> = None;
+     let mut i = 0;
+     while i < argv.len() {
+         let a = argv[i].as_str();
+@@ -462,6 +464,14 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+                     dump = Some(Dump { file: x, dot: false, opts: String::new() });
+                 }
+             }
++            "-debugger" => {
++                // like TLC: the next argument is the option list when it names port=, (no)suspend or (no)halt
++                let opts = argv.get(i + 1).filter(|x| ["port=", "nosuspend", "nohalt", "suspend", "halt"].iter().any(|k| x.contains(k))).cloned();
++                if opts.is_some() {
++                    i += 1;
++                }
++                debugger = Some(opts);
++            }
+             "-simulate" | "-hunt" | "-generate" | "-depth" | "-seed" | "-aril" => {
+                 if let Err(e) = sim.parse(argv, &mut i) {
+                     host.print(&format!("{}\n", e));
+@@ -496,6 +506,14 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+             return 1;
+         }
+     };
++    // -debugger implies -workers 1 (TLC), and the client gets what is printed as output events
++    #[cfg(target_arch = "wasm32")]
++    let debugger: Option<Option<String>> = debugger.and(None);
++    if debugger.is_some() {
++        workers = 1;
++    }
++    #[cfg(not(target_arch = "wasm32"))]
++    let host: HostRef = if debugger.is_some() { Rc::new(crate::dap::TeeHost(host)) } else { host };
+     let spec_path = if spec.ends_with(".tla") { spec.clone() } else { format!("{}.tla", spec) };
+     let cwd = host.cwd();
+     let dir = dirname(&path_resolve(&cwd, &spec_path));
+@@ -631,6 +649,18 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+     if !json {
+         rep.msg(2185, 0, &format!("Starting... ({})", rep.now()));
+     }
++    #[cfg(not(target_arch = "wasm32"))]
++    let debugging = match (&debugger, &sim) {
++        (Some(opts), None) => {
++            let o = crate::dap::Options::parse(opts.as_deref());
++            if let Err(e) = crate::dap::start(&model, &o, &parsed.borrow()) {
++                rep.plain(&e);
++                return finish(1);
++            }
++            true
++        }
++        _ => false,
++    };
+     if let Some(o) = &sim {
+         let code = crate::simulate::run_cli(&rep, &model, o, deadlock, json, t0, &dump_traces);
+         return if json { code } else { finish(code) };
+@@ -638,6 +668,13 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+     let mut events = CliEvents { rep: &rep, json, first: true };
+     let par = par_config(workers, &root_name, cfg_text.take(), sources.take());
+     let (res, checker) = model_check(&model, CheckOptions { check_deadlock: deadlock && model.check_deadlock, record_graph: dump.is_some(), par }, &mut events);
++    #[cfg(not(target_arch = "wasm32"))]
++    if debugging {
++        if let (Some(tr), None) = (&res.trace, res.loop_to) {
++            crate::dap::replay(model.ev, &checker, tr);
++        }
++        crate::dap::finish(model.ev);
++    }
+     let first = events.first;
+     if let Some(d) = &dump {
+         if let Err(e) = write_dump(&model, &checker, d, &host) {
+diff --git a/src/dap.rs b/src/dap.rs
+new file mode 100644
+index 0000000..01f0126
+--- /dev/null
++++ b/src/dap.rs
+@@ -0,0 +1,2060 @@
++//! TLC's `-debugger` option: a Debug Adapter Protocol server (TLC's tlc2.debug.TLCDebugger).
++//!
++//! `-debugger [nosuspend][,nohalt][,port=N]` (default port 4712) makes the run listen for one DAP client
++//! at a time. As in TLC, the search runs on one worker and evaluation has a stack of frames: one per
++//! expression the tree-walking evaluator evaluates (literals excepted) and one per expression the
++//! action enumerator decomposes; the frames of the conjuncts of an action nest, since the enumerator works
++//! with continuations. Execution halts when a frame is pushed that
++//! * the step mode asks for (stepIn: any frame; next/stepOut: a frame at the same syntactic depth of the same
++//!   operator definition as the frame stepped from or its parent), or
++//! * begins on the line of a breakpoint (at or after its column), no frame further down the stack matches
++//!   the same breakpoint, and the breakpoint's condition holds there (state and action frames only, like
++//!   TLC; a condition that does not parse, fails, or is not Boolean does not prevent the halt), or
++//! * when the frame stepped from with next/stepOut is popped (an "Exit:" frame).
++//! Without `nosuspend` the run halts at the first frame until a client resumes it.
++//!
++//! Threads: the evaluator's data is single-threaded (`Rc`), so the socket is read on a thread of its own
++//! that answers what needs no evaluator data (initialize, setBreakpoints, configurationDone, threads, and
++//! everything while the search runs) and queues the rest for the evaluator thread, which serves the queue
++//! while it is halted. Responses and events from both threads are serialized on the socket.
++//!
++//! Nothing here runs unless `-debugger` was given: the evaluator reaches this module only through the
++//! `dbg` flag (see `Evaluator::eval_hooked` and `Evaluator::enumerate`).
++use crate::ast::*;
++use crate::checker::TraceStep;
++use crate::eval::*;
++use crate::intern::*;
++use crate::model::Model;
++use crate::modules::{Def, Loader, Sym};
++use crate::value::*;
++use std::cell::{Cell, OnceCell, RefCell};
++use std::collections::{HashMap, HashSet, VecDeque};
++use std::io::{Read, Write};
++use std::net::{TcpListener, TcpStream};
++use std::rc::Rc;
++use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering::*};
++use std::sync::{Arc, Condvar, Mutex, OnceLock};
++
++// ------------------------------------------------------------------------------------------------
++// A small JSON value, parser and printer (the protocol's messages).
++// ------------------------------------------------------------------------------------------------
++
++#[derive(Clone, Debug)]
++pub enum J {
++    Null,
++    Bool(bool),
++    Num(f64),
++    Str(String),
++    Arr(Vec<J>),
++    Obj(Vec<(String, J)>),
++}
++static JNULL: J = J::Null;
++impl J {
++    fn get(&self, k: &str) -> &J {
++        match self {
++            J::Obj(v) => v.iter().find(|(n, _)| n == k).map(|(_, x)| x).unwrap_or(&JNULL),
++            _ => &JNULL,
++        }
++    }
++    fn str(&self) -> Option<&str> {
++        match self {
++            J::Str(s) => Some(s),
++            _ => None,
++        }
++    }
++    fn int(&self) -> Option<i64> {
++        match self {
++            J::Num(n) => Some(*n as i64),
++            J::Str(s) => s.trim().parse().ok(),
++            _ => None,
++        }
++    }
++    fn arr(&self) -> &[J] {
++        match self {
++            J::Arr(v) => v,
++            _ => &[],
++        }
++    }
++    fn is_null(&self) -> bool {
++        matches!(self, J::Null)
++    }
++}
++fn s(x: &str) -> J {
++    J::Str(x.to_string())
++}
++fn n(x: i64) -> J {
++    J::Num(x as f64)
++}
++fn obj(v: Vec<(&str, J)>) -> J {
++    J::Obj(v.into_iter().map(|(k, x)| (k.to_string(), x)).collect())
++}
++
++fn json_parse(src: &str) -> Option<J> {
++    struct P<'a> {
++        b: &'a [u8],
++        i: usize,
++    }
++    impl P<'_> {
++        fn ws(&mut self) {
++            while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
++                self.i += 1;
++            }
++        }
++        fn val(&mut self) -> Option<J> {
++            self.ws();
++            match *self.b.get(self.i)? {
++                b'{' => {
++                    self.i += 1;
++                    let mut v = vec![];
++                    self.ws();
++                    if self.b.get(self.i) == Some(&b'}') {
++                        self.i += 1;
++                        return Some(J::Obj(v));
++                    }
++                    loop {
++                        self.ws();
++                        let k = match self.val()? {
++                            J::Str(k) => k,
++                            _ => return None,
++                        };
++                        self.ws();
++                        if self.b.get(self.i) != Some(&b':') {
++                            return None;
++                        }
++                        self.i += 1;
++                        let x = self.val()?;
++                        v.push((k, x));
++                        self.ws();
++                        match self.b.get(self.i)? {
++                            b',' => self.i += 1,
++                            b'}' => {
++                                self.i += 1;
++                                return Some(J::Obj(v));
++                            }
++                            _ => return None,
++                        }
++                    }
++                }
++                b'[' => {
++                    self.i += 1;
++                    let mut v = vec![];
++                    self.ws();
++                    if self.b.get(self.i) == Some(&b']') {
++                        self.i += 1;
++                        return Some(J::Arr(v));
++                    }
++                    loop {
++                        v.push(self.val()?);
++                        self.ws();
++                        match self.b.get(self.i)? {
++                            b',' => self.i += 1,
++                            b']' => {
++                                self.i += 1;
++                                return Some(J::Arr(v));
++                            }
++                            _ => return None,
++                        }
++                    }
++                }
++                b'"' => {
++                    self.i += 1;
++                    let mut o: Vec<u8> = vec![];
++                    loop {
++                        let c = *self.b.get(self.i)?;
++                        self.i += 1;
++                        match c {
++                            b'"' => return Some(J::Str(String::from_utf8_lossy(&o).into_owned())),
++                            b'\\' => {
++                                let e = *self.b.get(self.i)?;
++                                self.i += 1;
++                                match e {
++                                    b'n' => o.push(b'\n'),
++                                    b't' => o.push(b'\t'),
++                                    b'r' => o.push(b'\r'),
++                                    b'b' => o.push(8),
++                                    b'f' => o.push(12),
++                                    b'u' => {
++                                        let h = std::str::from_utf8(self.b.get(self.i..self.i + 4)?).ok()?;
++                                        let mut cp = u32::from_str_radix(h, 16).ok()?;
++                                        self.i += 4;
++                                        if (0xD800..0xDC00).contains(&cp) && self.b.get(self.i) == Some(&b'\\') && self.b.get(self.i + 1) == Some(&b'u') {
++                                            let h2 = std::str::from_utf8(self.b.get(self.i + 2..self.i + 6)?).ok()?;
++                                            let lo = u32::from_str_radix(h2, 16).ok()?;
++                                            self.i += 6;
++                                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3ff);
++                                        }
++                                        let ch = char::from_u32(cp).unwrap_or('\u{fffd}');
++                                        let mut buf = [0u8; 4];
++                                        o.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
++                                    }
++                                    x => o.push(x),
++                                }
++                            }
++                            x => o.push(x),
++                        }
++                    }
++                }
++                b't' if self.b[self.i..].starts_with(b"true") => {
++                    self.i += 4;
++                    Some(J::Bool(true))
++                }
++                b'f' if self.b[self.i..].starts_with(b"false") => {
++                    self.i += 5;
++                    Some(J::Bool(false))
++                }
++                b'n' if self.b[self.i..].starts_with(b"null") => {
++                    self.i += 4;
++                    Some(J::Null)
++                }
++                _ => {
++                    let st = self.i;
++                    while self.i < self.b.len() && matches!(self.b[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
++                        self.i += 1;
++                    }
++                    std::str::from_utf8(&self.b[st..self.i]).ok()?.parse::<f64>().ok().map(J::Num)
++                }
++            }
++        }
++    }
++    P { b: src.as_bytes(), i: 0 }.val()
++}
++
++fn json_str(x: &str, o: &mut String) {
++    o.push('"');
++    for c in x.chars() {
++        match c {
++            '"' => o.push_str("\\\""),
++            '\\' => o.push_str("\\\\"),
++            '\n' => o.push_str("\\n"),
++            '\r' => o.push_str("\\r"),
++            '\t' => o.push_str("\\t"),
++            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
++            c => o.push(c),
++        }
++    }
++    o.push('"');
++}
++fn json_write(j: &J, o: &mut String) {
++    match j {
++        J::Null => o.push_str("null"),
++        J::Bool(b) => o.push_str(if *b { "true" } else { "false" }),
++        J::Num(x) => {
++            if x.fract() == 0.0 && x.abs() < 9e15 {
++                o.push_str(&format!("{}", *x as i64))
++            } else {
++                o.push_str(&format!("{}", x))
++            }
++        }
++        J::Str(x) => json_str(x, o),
++        J::Arr(v) => {
++            o.push('[');
++            for (i, x) in v.iter().enumerate() {
++                if i > 0 {
++                    o.push(',');
++                }
++                json_write(x, o);
++            }
++            o.push(']');
++        }
++        J::Obj(v) => {
++            o.push('{');
++            for (i, (k, x)) in v.iter().enumerate() {
++                if i > 0 {
++                    o.push(',');
++                }
++                json_str(k, o);
++                o.push(':');
++                json_write(x, o);
++            }
++            o.push('}');
++        }
++    }
++}
++
++// ------------------------------------------------------------------------------------------------
++// State shared by the socket thread and the evaluator thread.
++// ------------------------------------------------------------------------------------------------
++
++#[derive(Clone)]
++struct RawBp {
++    line: i64,
++    col: Option<i64>,
++    cond: Option<String>,
++    hit: Option<String>,
++}
++
++// run-control asked for while the evaluator runs (taken by the evaluator at its next frame)
++const P_NONE: u8 = 0;
++const P_CONTINUE: u8 = 1;
++const P_IN: u8 = 2;
++const P_OVER: u8 = 3;
++const P_OUT: u8 = 4;
++const P_DISCONNECT: u8 = 5;
++const P_TERMINATE: u8 = 6;
++
++#[derive(Default)]
++struct Ctl {
++    halted: bool,
++    queue: VecDeque<J>,
++    bps: HashMap<String, Vec<RawBp>>,
++    connected: bool,
++    /// output printed before a client connected (sent on `launch`, as TLC does)
++    buffer: String,
++}
++
++struct Shared {
++    out: Mutex<Option<TcpStream>>,
++    seq: AtomicI64,
++    ctl: Mutex<Ctl>,
++    cv: Condvar,
++    bp_ver: AtomicU64,
++    pending: AtomicU8,
++    halt_exp: AtomicBool,
++    /// per module: the lines some expression begins and ends on (TLC's `verified`)
++    lines: HashMap<String, HashSet<i64>>,
++}
++
++static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
++
++impl Shared {
++    fn write_raw(&self, f: impl FnOnce(i64) -> String) {
++        let mut out = self.out.lock().unwrap();
++        if let Some(st) = out.as_mut() {
++            let seq = self.seq.fetch_add(1, SeqCst);
++            let body = f(seq);
++            let msg = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
++            if st.write_all(msg.as_bytes()).is_err() {
++                *out = None;
++            }
++        }
++    }
++    fn respond(&self, req: &J, body: Option<J>) {
++        let rs = req.get("seq").int().unwrap_or(0);
++        let cmd = req.get("command").str().unwrap_or("").to_string();
++        self.write_raw(|seq| {
++            let mut o = format!("{{\"type\":\"response\",\"seq\":{},\"request_seq\":{},\"command\":", seq, rs);
++            json_str(&cmd, &mut o);
++            o.push_str(",\"success\":true");
++            if let Some(b) = &body {
++                o.push_str(",\"body\":");
++                json_write(b, &mut o);
++            }
++            o.push('}');
++            o
++        });
++    }
++    fn event(&self, name: &str, body: Option<J>) {
++        self.write_raw(|seq| {
++            let mut o = format!("{{\"type\":\"event\",\"seq\":{},\"event\":", seq);
++            json_str(name, &mut o);
++            if let Some(b) = &body {
++                o.push_str(",\"body\":");
++                json_write(b, &mut o);
++            }
++            o.push('}');
++            o
++        });
++    }
++}
++
++/// Output of the run (everything the host prints): an output event while a client is connected,
++/// buffered otherwise.
++pub fn output(text: &str) {
++    if let Some(sh) = SHARED.get() {
++        let connected = {
++            let mut c = sh.ctl.lock().unwrap();
++            if !c.connected {
++                c.buffer.push_str(text);
++            }
++            c.connected
++        };
++        if connected {
++            sh.event("output", Some(obj(vec![("output", s(text))])));
++        }
++    }
++}
++
++/// A host that also sends what is printed to the debugger client.
++pub struct TeeHost(pub crate::host::HostRef);
++impl crate::host::Host for TeeHost {
++    fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
++        self.0.read_file(path)
++    }
++    fn write_file(&self, path: &str, data: &[u8]) -> Result<(), String> {
++        self.0.write_file(path, data)
++    }
++    fn append_file(&self, path: &str, data: &[u8]) -> Result<(), String> {
++        self.0.append_file(path, data)
++    }
++    fn exists(&self, path: &str) -> bool {
++        self.0.exists(path)
++    }
++    fn env(&self) -> Vec<(String, String)> {
++        self.0.env()
++    }
++    fn exec(&self, command: &[String], env: Option<&[(String, String)]>) -> Result<(i32, String, String), String> {
++        self.0.exec(command, env)
++    }
++    fn print(&self, text: &str) {
++        self.0.print(text);
++        output(text);
++    }
++    fn now_ms(&self) -> f64 {
++        self.0.now_ms()
++    }
++    fn cwd(&self) -> String {
++        self.0.cwd()
++    }
++}
++
++/// The options of `-debugger`.
++pub struct Options {
++    pub port: u16,
++    pub suspend: bool,
++    pub halt: bool,
++}
++impl Options {
++    pub fn parse(arg: Option<&str>) -> Options {
++        let mut o = Options { port: 4712, suspend: true, halt: true };
++        if let Some(a) = arg {
++            let l = a.to_lowercase();
++            o.suspend = !l.contains("nosuspend");
++            o.halt = !l.contains("nohalt");
++            if let Some(i) = a.find("port=") {
++                let d: String = a[i + 5..].chars().take_while(|c| c.is_ascii_digit()).take(5).collect();
++                if let Ok(p) = d.parse() {
++                    o.port = p;
++                }
++            }
++        }
++        o
++    }
++}
++
++// ------------------------------------------------------------------------------------------------
++// The socket thread.
++// ------------------------------------------------------------------------------------------------
++
++fn capabilities() -> J {
++    let filter = |id: &str, label: &str, desc: &str, def: bool, cond: Option<&str>| {
++        let mut v = vec![("filter", s(id)), ("label", s(label)), ("description", s(desc)), ("default", J::Bool(def))];
++        if let Some(c) = cond {
++            v.push(("supportsCondition", J::Bool(true)));
++            v.push(("conditionDescription", s(c)));
++        }
++        obj(v)
++    };
++    let halt = SHARED.get().map_or(true, |sh| sh.halt_exp.load(SeqCst));
++    obj(vec![
++        ("supportsGotoState", J::Bool(false)),
++        ("supportsFunctionBreakpoints", J::Bool(false)),
++        ("supportsConditionalBreakpoints", J::Bool(true)),
++        ("supportsHitConditionalBreakpoints", J::Bool(true)),
++        ("supportsEvaluateForHovers", J::Bool(true)),
++        (
++            "exceptionBreakpointFilters",
++            J::Arr(vec![
++                filter("ExceptionBreakpointsFilter", "Halt (break) on exceptions", "TLC will halt when it encounters a silly expression", halt, None),
++                filter(
++                    "UnsatisfiedBreakpointsFilter",
++                    "Halt (break) on unsatisfied",
++                    "TLC will halt when a successor state does not satisfy the next-state relation.",
++                    false,
++                    Some("A constant, state, or action level formula"),
++                ),
++                filter(
++                    "SpecBreakpointsFilter",
++                    "Halt (break) after Init and Next",
++                    "TLC will halt after initial- and next-states have been generated.",
++                    false,
++                    Some("Init: constant or state formula. Next: constant, state, or action-level formula."),
++                ),
++            ]),
++        ),
++        ("supportsStepBack", J::Bool(true)),
++        ("supportsGotoTargetsRequest", J::Bool(false)),
++        ("supportsValueFormattingOptions", J::Bool(false)),
++        ("supportsExceptionInfoRequest", J::Bool(false)),
++        ("supportsLogPoints", J::Bool(false)),
++        ("supportsTerminateRequest", J::Bool(true)),
++        ("supportsDataBreakpoints", J::Bool(false)),
++        ("supportsDisassembleRequest", J::Bool(false)),
++        ("supportsClipboardContext", J::Bool(true)),
++        ("supportsSteppingGranularity", J::Bool(false)),
++        ("supportsInstructionBreakpoints", J::Bool(false)),
++        ("supportsExceptionFilterOptions", J::Bool(true)),
++    ])
++}
++
++fn read_message(st: &mut TcpStream, buf: &mut Vec<u8>) -> Option<J> {
++    loop {
++        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
++            let head = String::from_utf8_lossy(&buf[..p]).into_owned();
++            let len: usize = head.lines().find_map(|l| l.strip_prefix("Content-Length:").map(|x| x.trim().parse().unwrap_or(0))).unwrap_or(0);
++            if buf.len() >= p + 4 + len {
++                let body = String::from_utf8_lossy(&buf[p + 4..p + 4 + len]).into_owned();
++                buf.drain(..p + 4 + len);
++                return Some(json_parse(&body).unwrap_or(J::Null));
++            }
++        }
++        let mut chunk = [0u8; 65536];
++        match st.read(&mut chunk) {
++            Ok(0) | Err(_) => return None,
++            Ok(k) => buf.extend_from_slice(&chunk[..k]),
++        }
++    }
++}
++
++fn serve(listener: TcpListener, sh: Arc<Shared>) {
++    for conn in listener.incoming() {
++        let mut st = match conn {
++            Ok(x) => x,
++            Err(_) => continue,
++        };
++        let _ = st.set_nodelay(true);
++        *sh.out.lock().unwrap() = st.try_clone().ok();
++        sh.ctl.lock().unwrap().connected = true;
++        let mut buf = vec![];
++        while let Some(req) = read_message(&mut st, &mut buf) {
++            if req.get("type").str() == Some("request") {
++                dispatch(&sh, req);
++            }
++        }
++        // the client went away: as after a disconnect request (TLC would stay halted; nobody could resume it)
++        *sh.out.lock().unwrap() = None;
++        let mut c = sh.ctl.lock().unwrap();
++        c.connected = false;
++        c.bps.clear();
++        sh.bp_ver.fetch_add(1, SeqCst);
++        if c.halted {
++            c.queue.push_back(obj(vec![("command", s("disconnect")), ("_eof", J::Bool(true))]));
++            sh.cv.notify_all();
++        } else {
++            sh.pending.store(P_DISCONNECT, SeqCst);
++        }
++        drop(c);
++        println!("Debugger is listening on {}", listener.local_addr().map(|a| format!("0.0.0.0/{}", a)).unwrap_or_default());
++    }
++}
++
++fn dispatch(sh: &Arc<Shared>, req: J) {
++    let cmd = req.get("command").str().unwrap_or("").to_string();
++    let args = req.get("arguments").clone();
++    match cmd.as_str() {
++        "initialize" => sh.respond(&req, Some(capabilities())),
++        "launch" => {
++            sh.respond(&req, None);
++            sh.event("initialized", None);
++            let b = std::mem::take(&mut sh.ctl.lock().unwrap().buffer);
++            if !b.is_empty() {
++                sh.event("output", Some(obj(vec![("output", J::Str(b))])));
++            }
++            sh.event("stopped", Some(obj(vec![("reason", s("")), ("threadId", n(0))])));
++        }
++        "attach" | "configurationDone" | "setFunctionBreakpoints" | "setDataBreakpoints" | "setInstructionBreakpoints" | "source" | "loadedSources" | "pause" | "restart" | "goto" => {
++            sh.respond(&req, None)
++        }
++        "threads" => sh.respond(&req, Some(obj(vec![("threads", J::Arr(vec![obj(vec![("id", n(0)), ("name", s("worker"))])]))]))),
++        "setExceptionBreakpoints" => {
++            let mut ids: Vec<String> = args.get("filters").arr().iter().filter_map(|f| f.str().map(|x| x.to_string())).collect();
++            ids.extend(args.get("filterOptions").arr().iter().filter_map(|f| f.get("filterId").str().map(|x| x.to_string())));
++            sh.halt_exp.store(ids.iter().any(|x| x == "ExceptionBreakpointsFilter"), SeqCst);
++            sh.respond(&req, Some(obj(vec![])));
++        }
++        "setBreakpoints" => {
++            let source = args.get("source").clone();
++            let name = source.get("name").str().or_else(|| source.get("path").str().map(|p| p.rsplit('/').next().unwrap_or(p))).unwrap_or("");
++            let module = name.strip_suffix(".tla").unwrap_or(name).to_string();
++            let list = args.get("breakpoints").arr();
++            let mut raw = vec![];
++            let mut resp = vec![];
++            for (j, b) in list.iter().enumerate() {
++                let line = b.get("line").int().unwrap_or(0);
++                let col = b.get("column").int();
++                let cond = b.get("condition").str().filter(|c| !c.trim().is_empty()).map(|c| c.to_string());
++                let hit = b.get("hitCondition").str().map(|c| c.to_string());
++                let verified = match sh.lines.get(&module) {
++                    Some(ls) => ls.contains(&line),
++                    None => true, // TLC: an unknown module verifies every breakpoint
++                };
++                let mut o = vec![("id", n(j as i64)), ("verified", J::Bool(verified)), ("source", source.clone()), ("line", n(line))];
++                if let Some(c) = col {
++                    o.push(("column", n(c)));
++                }
++                resp.push(obj(o));
++                raw.push(RawBp { line, col, cond, hit });
++            }
++            {
++                let mut c = sh.ctl.lock().unwrap();
++                if raw.is_empty() {
++                    c.bps.remove(&module);
++                } else {
++                    c.bps.insert(module, raw);
++                }
++            }
++            sh.bp_ver.fetch_add(1, SeqCst);
++            sh.respond(&req, Some(obj(vec![("breakpoints", J::Arr(resp))])));
++        }
++        "stackTrace" | "scopes" | "variables" | "evaluate" | "continue" | "next" | "stepIn" | "stepOut" | "disconnect" | "terminate" | "stepBack" | "reverseContinue" => {
++            let mut c = sh.ctl.lock().unwrap();
++            if c.halted {
++                c.queue.push_back(req);
++                sh.cv.notify_all();
++                return;
++            }
++            if cmd == "disconnect" || cmd == "terminate" {
++                c.bps.clear();
++                sh.bp_ver.fetch_add(1, SeqCst);
++            }
++            drop(c);
++            not_halted(sh, &req);
++        }
++        _ => sh.respond(&req, None),
++    }
++}
++
++/// A request that needs the evaluator while it is not halted: what TLC answers then.
++fn not_halted(sh: &Shared, req: &J) {
++    match req.get("command").str().unwrap_or("") {
++        "stackTrace" => sh.respond(req, Some(obj(vec![("stackFrames", J::Arr(vec![])), ("totalFrames", n(0))]))),
++        "scopes" => sh.respond(req, Some(obj(vec![("scopes", J::Arr(vec![]))]))),
++        "variables" => sh.respond(req, Some(obj(vec![("variables", J::Arr(vec![]))]))),
++        "evaluate" => sh.respond(req, Some(obj(vec![("variablesReference", n(0))]))),
++        "continue" => {
++            sh.pending.store(P_CONTINUE, SeqCst);
++            sh.respond(req, Some(obj(vec![])));
++        }
++        "next" => {
++            sh.pending.store(P_OVER, SeqCst);
++            sh.respond(req, None);
++        }
++        "stepIn" => {
++            sh.pending.store(P_IN, SeqCst);
++            sh.respond(req, None);
++        }
++        "stepOut" => {
++            sh.pending.store(P_OUT, SeqCst);
++            sh.respond(req, None);
++        }
++        "disconnect" => {
++            sh.halt_exp.store(false, SeqCst);
++            sh.pending.store(P_DISCONNECT, SeqCst);
++            if !req.get("_eof").is_null() {
++                return;
++            }
++            sh.respond(req, None);
++        }
++        "terminate" => {
++            sh.halt_exp.store(false, SeqCst);
++            sh.pending.store(P_TERMINATE, SeqCst);
++            sh.event("terminated", Some(obj(vec![])));
++            sh.respond(req, None);
++        }
++        _ => sh.respond(req, None),
++    }
++}
++
++// ------------------------------------------------------------------------------------------------
++// The evaluator side.
++// ------------------------------------------------------------------------------------------------
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum Step {
++    Continue,
++    In,
++    Over,
++    Out,
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Kind {
++    Const,
++    State,
++    Action,
++    /// the frame of all successors of a state (TLC's TLCNextStatesStackFrame)
++    Next,
++    /// the frame of the initial states (TLC's TLCInitStatesStackFrame)
++    Init,
++    /// a state of the trace to the current state (TLC's TLCSyntheticStateStackFrame)
++    Trace,
++}
++
++struct Frame {
++    id: i64,
++    node: N,
++    ctx: C,
++    kind: Kind,
++    cur: StateRef,
++    nxt: Option<StateRef>,
++    init: bool,
++    level: i64,
++    action: Option<usize>,
++    exit: bool,
++    exception: Option<String>,
++    /// trace frames: the name, the successor (for primed variables)
++    name: Option<String>,
++}
++
++enum Cond {
++    None,
++    /// the source, and its compilations per list of in-scope names
++    Text(String, RefCell<HashMap<Vec<Name>, Option<&'static Def>>>),
++}
++struct Bp {
++    line: i64,
++    col: i64,
++    cond: Cond,
++    hits: i64,
++}
++
++enum VarSrc {
++    Value(Value),
++    Ctx(i64),
++    Constants,
++    ConstGroup(Vec<(String, Value)>),
++    /// the variables of a state record (values printed as nested values: strings quoted)
++    Fields(Vec<(String, Value)>),
++    State(i64),
++    Trace(i64),
++}
++
++struct ActionInfo {
++    node: N,
++    ctx: C,
++    label: String,
++}
++
++pub struct Dbg {
++    sh: Arc<Shared>,
++    root: String,
++    vars: Vec<String>,
++    nvars: usize,
++    actions: Vec<ActionInfo>,
++    init_label: String,
++    init_node: Option<N>,
++    next_node: Option<N>,
++    loader: RefCell<Loader>,
++    paths: HashMap<String, String>,
++    consts: Vec<(&'static crate::modules::Decl, String)>,
++    const_defs: Vec<&'static Def>,
++    frames: RefCell<Vec<Frame>>,
++    synth: RefCell<Vec<Frame>>,
++    next_id: Cell<i64>,
++    step: Cell<Step>,
++    source: Cell<Option<i64>>,
++    source_key: Cell<Option<(u32, usize)>>,
++    bps: RefCell<HashMap<String, Vec<Bp>>>,
++    bp_ver: Cell<u64>,
++    trace: RefCell<Vec<TraceStep>>,
++    succ_action: Cell<Option<usize>>,
++    vrefs: RefCell<Vec<VarSrc>>,
++    depth: OnceCell<HashMap<usize, (u32, usize)>>,
++    exc_seen: Cell<usize>,
++    expr_no: Cell<u64>,
++    /// without `nosuspend`: halt at the first frame of the search (that of the assumptions or of the
++    /// initial states) until a client resumes the run
++    first: Cell<bool>,
++}
++
++thread_local! {
++    static DBG: Cell<Option<&'static Dbg>> = const { Cell::new(None) };
++}
++fn dbg() -> &'static Dbg {
++    DBG.with(|d| d.get()).expect("debugger not started")
++}
++
++fn mod_of(nd: N, root: &str) -> String {
++    nd.module_str().unwrap_or_else(|| root.to_string())
++}
++fn loc_name(l: &Loc, module: &str) -> String {
++    crate::model::loc_str(l, module)
++}
++
++/// Walks every definition: per node, its depth below the start of its definition and the definition.
++fn walk_defs(loader: &Loader, f: &mut dyn FnMut(N, u32, usize, &str)) {
++    fn walk(nd: N, depth: u32, def: usize, module: &str, f: &mut dyn FnMut(N, u32, usize, &str)) {
++        f(nd, depth, def, module);
++        if let E::Let { defs, body } = &nd.e {
++            for d in defs {
++                match d {
++                    LetDef::Def(dn) => walk(&dn.body, 0, dn as *const DefNode as usize, module, f),
++                    LetDef::Inst(_) => {}
++                }
++            }
++            walk(body, depth + 1, def, module, f);
++            return;
++        }
++        crate::modules::for_children(nd, &mut |c| walk(c, depth + 1, def, module, f));
++    }
++    let mut seen: HashSet<usize> = HashSet::new();
++    let mut mods: Vec<_> = loader.modules.iter().collect();
++    mods.sort_by_key(|(k, _)| k.0);
++    for (mname, info) in mods {
++        let m = name_str(*mname).to_string();
++        for d in &info.own_defs {
++            if let Some(b) = d.body.get() {
++                if seen.insert(b as *const Node as usize) {
++                    walk(b, 0, *d as *const Def as usize, &m, f);
++                }
++            }
++        }
++        for a in &info.assumes {
++            if seen.insert(a.e as *const Node as usize) {
++                walk(a.e, 0, a.e as *const Node as usize, &m, f);
++            }
++        }
++    }
++}
++
++/// Sets up the debugger for a run of `model`; prints TLC's "Debugger is listening" line.
++pub fn start(model: &Model, opts: &Options, files: &[String]) -> Result<(), String> {
++    let ev = model.ev;
++    let listener = TcpListener::bind(("0.0.0.0", opts.port)).map_err(|e| format!("Error: the debugger cannot listen on port {}: {}", opts.port, e))?;
++    let port = listener.local_addr().map(|a| a.port()).unwrap_or(opts.port);
++    // lines on which an expression begins and ends (TLC verifies a breakpoint by that)
++    let mut lines: HashMap<String, HashSet<i64>> = HashMap::new();
++    walk_defs(&model.loader, &mut |nd, _, _, m| {
++        if nd.loc[0] == nd.loc[2] && nd.loc[0] > 0 {
++            lines.entry(mod_of(nd, m)).or_default().insert(nd.loc[0] as i64);
++        }
++    });
++    let sh = Arc::new(Shared {
++        out: Mutex::new(None),
++        seq: AtomicI64::new(1),
++        ctl: Mutex::new(Ctl::default()),
++        cv: Condvar::new(),
++        bp_ver: AtomicU64::new(0),
++        pending: AtomicU8::new(P_NONE),
++        halt_exp: AtomicBool::new(opts.halt),
++        lines,
++    });
++    let _ = SHARED.set(sh.clone());
++    // TLC evaluates the constant definitions before the search (without the debugger): so does this.
++    let mut const_defs = vec![];
++    {
++        let blank = StateData::blank(model.vars.len());
++        ev.set_state(&blank, None);
++        let mut mods: Vec<_> = model.loader.modules.iter().collect();
++        mods.sort_by_key(|(k, _)| k.0);
++        for (_, info) in mods {
++            for d in &info.own_defs {
++                if !d.params.is_empty() || d.inst.is_some() || d.builtin.get().is_some() || d.local {
++                    continue;
++                }
++                let d = d.resolved();
++                if d.builtin.get().is_some() || crate::modules::def_level(d) != 0 {
++                    continue;
++                }
++                let body = match d.body.get() {
++                    Some(b) => b,
++                    None => continue,
++                };
++                if d.cache.borrow().is_none() {
++                    let (s0, p0) = (ev.st_touch.get(), ev.pr_touch.get());
++                    if let Ok(v) = ev.eval(body, &None) {
++                        if ev.st_touch.get() == s0 && ev.pr_touch.get() == p0 {
++                            *d.cache.borrow_mut() = Some(v);
++                        }
++                    }
++                }
++                if d.cache.borrow().is_some() && !const_defs.iter().any(|x: &&'static Def| std::ptr::eq(*x, d)) {
++                    const_defs.push(d);
++                }
++            }
++        }
++    }
++    let init_label = match model.inits.first() {
++        Some(p) => format!("<{} {}>", p.name, loc_name(&p.e.loc, &mod_of(p.e, &model.root_name))),
++        None => "<Initial predicate>".to_string(),
++    };
++    let mut loader = Loader::new(Box::new(|_| None), model.loader.builtins.clone());
++    loader.modules = model.loader.modules.clone();
++    let mut paths = HashMap::new();
++    for f in files {
++        let b = crate::cli::basename(f, ".tla").to_string();
++        paths.entry(b).or_insert_with(|| f.clone());
++    }
++    let d: &'static Dbg = Box::leak(Box::new(Dbg {
++        sh: sh.clone(),
++        root: model.root_name.clone(),
++        vars: model.vars.iter().map(|v| v.name.to_string()).collect(),
++        nvars: model.vars.len(),
++        actions: model.actions.iter().map(|a| ActionInfo { node: a.e, ctx: a.ctx.clone(), label: crate::cli::action_label(Some(a)) }).collect(),
++        init_label,
++        init_node: model.inits.first().map(|p| p.e),
++        next_node: model.next_pred,
++        loader: RefCell::new(loader),
++        paths,
++        consts: model.root.consts.iter().map(|c| (*c, c.name.to_string())).collect(),
++        const_defs,
++        frames: RefCell::new(vec![]),
++        synth: RefCell::new(vec![]),
++        next_id: Cell::new(1),
++        step: Cell::new(Step::Continue),
++        source: Cell::new(None),
++        source_key: Cell::new(None),
++        bps: RefCell::new(HashMap::new()),
++        bp_ver: Cell::new(u64::MAX),
++        trace: RefCell::new(vec![]),
++        succ_action: Cell::new(None),
++        vrefs: RefCell::new(vec![]),
++        depth: OnceCell::new(),
++        exc_seen: Cell::new(0),
++        expr_no: Cell::new(0),
++        first: Cell::new(opts.suspend),
++    }));
++    DBG.with(|c| c.set(Some(d)));
++    {
++        use std::io::Write as _;
++        let mut o = std::io::stdout().lock();
++        let _ = writeln!(o, "Debugger is listening on 0.0.0.0/0.0.0.0:{}", port);
++        let _ = o.flush();
++    }
++    std::thread::Builder::new().name("dap".into()).spawn(move || serve(listener, sh)).map_err(|e| e.to_string())?;
++    ev.set_debug(true);
++    Ok(())
++}
++
++/// The search is over: no more frames.
++pub fn finish(ev: &Evaluator) {
++    ev.set_debug(false);
++}
++
++/// TLC rebuilds the trace of a safety violation from the fingerprints, by evaluating the initial predicate
++/// and then, from each state of the trace, the actions in order until one produces the next state; it does
++/// so twice (for the printed trace and the trace exploration file). With the debugger those evaluations
++/// are frames like any other, so they are made here as well.
++pub fn replay(ev: &Evaluator, ck: &crate::checker::Checker, trace: &[TraceStep]) {
++    let d = dbg();
++    let nv = d.nvars;
++    for _ in 0..2 {
++        {
++            let _g = NextGuard::init(ev);
++            ev.stats.level.set(0);
++            let _ = ck.enumerate_init();
++        }
++        for i in 0..trace.len().saturating_sub(1) {
++            *d.trace.borrow_mut() = trace[..=i].to_vec();
++            d.succ_action.set(None);
++            ev.stats.level.set(i as i64 + 1);
++            let s = &trace[i].state;
++            let target = match ck.fingerprint(&trace[i + 1].state) {
++                Ok(f) => f,
++                Err(_) => return,
++            };
++            for a in &ck.model.actions {
++                let nxt = StateData::blank(nv);
++                ev.set_state(s, Some(&nxt));
++                ev.init_mode.set(false);
++                ev.prime_depth.set(0);
++                ev.call_depth.set(0);
++                ev.n_assigned.set(0);
++                let mut found = false;
++                let _ = ev.enumerate(a.e, &a.ctx, &mut || {
++                    if nxt.all_defined(nv) {
++                        let t = StateData::new(nxt.snapshot(nv));
++                        if ck.fingerprint(&t).ok() == Some(target) {
++                            found = true;
++                        }
++                    }
++                    Ok(())
++                });
++                if found {
++                    break;
++                }
++            }
++        }
++    }
++}
++
++// ---- hooks called by the evaluator and the checker ----
++
++pub(crate) fn eval_hook(ev: &Evaluator, nd: N, ctx: &C) -> R<Value> {
++    // TLC gives numerals and strings no frame, nor the names the configuration file gives (an invariant's
++    // frame is its definition's body)
++    if matches!(nd.e, E::Num(_) | E::Str(..)) || synthetic(nd) {
++        return ev.eval_hooked_plain(nd, ctx);
++    }
++    let d = dbg();
++    // the enumerator evaluating an expression it does not decompose: TLC has one frame for both
++    if d.frames.borrow().last().is_some_and(|f| std::ptr::eq(f.node, nd) && f.kind == Kind::Action) {
++        let r = ev.eval_hooked_plain(nd, ctx);
++        if let Err(e) = &r {
++            d.on_error(ev, e);
++        }
++        return r;
++    }
++    d.push(ev, nd, ctx, None);
++    let r = ev.eval_hooked_plain(nd, ctx);
++    if let Err(e) = &r {
++        d.on_error(ev, e);
++    }
++    d.pop(ev);
++    r
++}
++
++pub(crate) fn enum_hook(ev: &Evaluator, e: N, ctx: &C, k: &mut dyn FnMut() -> R<()>) -> R<()> {
++    if matches!(e.e, E::Let { .. }) {
++        return ev.enumerate_inner(e, ctx, k);
++    }
++    let d = dbg();
++    d.push(ev, e, ctx, None);
++    let r = ev.enumerate_inner(e, ctx, k);
++    d.pop(ev);
++    r
++}
++
++/// Around the successors of a state: the trace to it and TLC's frame of the next-state relation.
++pub struct NextGuard(bool);
++impl NextGuard {
++    pub fn new(ev: &Evaluator, trace: Vec<TraceStep>) -> NextGuard {
++        let d = dbg();
++        *d.trace.borrow_mut() = trace;
++        d.succ_action.set(None);
++        d.exc_seen.set(0);
++        match d.next_node {
++            Some(nn) => {
++                d.push(ev, nn, &None, Some(Kind::Next));
++                NextGuard(true)
++            }
++            None => NextGuard(false),
++        }
++    }
++    pub fn init(ev: &Evaluator) -> NextGuard {
++        let d = dbg();
++        d.trace.borrow_mut().clear();
++        match d.init_node {
++            Some(nn) => {
++                d.push(ev, nn, &None, Some(Kind::Init));
++                NextGuard(true)
++            }
++            None => NextGuard(false),
++        }
++    }
++}
++impl Drop for NextGuard {
++    fn drop(&mut self) {
++        if self.0 {
++            let d = dbg();
++            d.frames.borrow_mut().pop();
++        }
++    }
++}
++/// The checker looks at the successor of the current state that action `ai` produced.
++pub fn successor(ai: usize) {
++    dbg().succ_action.set(Some(ai));
++}
++
++/// The evaluator's state, kept across an evaluation the debugger makes.
++struct Saved {
++    cur: StateRef,
++    nxt: Option<StateRef>,
++    init: bool,
++    prime: u32,
++    call: u32,
++    nas: i64,
++    st: u64,
++    pr: u64,
++    inen: u32,
++}
++fn save(ev: &Evaluator) -> Saved {
++    Saved {
++        cur: ev.cur.borrow().clone(),
++        nxt: ev.nxt.borrow().clone(),
++        init: ev.init_mode.get(),
++        prime: ev.prime_depth.get(),
++        call: ev.call_depth.get(),
++        nas: ev.n_assigned.get(),
++        st: ev.st_touch.get(),
++        pr: ev.pr_touch.get(),
++        inen: ev.in_enabled.get(),
++    }
++}
++fn restore(ev: &Evaluator, s: Saved) {
++    *ev.cur.borrow_mut() = s.cur;
++    *ev.nxt.borrow_mut() = s.nxt;
++    ev.init_mode.set(s.init);
++    ev.prime_depth.set(s.prime);
++    ev.call_depth.set(s.call);
++    ev.n_assigned.set(s.nas);
++    ev.st_touch.set(s.st);
++    ev.pr_touch.set(s.pr);
++    ev.in_enabled.set(s.inen);
++}
++
++/// The message of a failed evaluation, as TLC words it in the debugger.
++fn fail_text(e: &Fail) -> String {
++    match e {
++        Fail::Tla(t) => match (&t.loc, &t.module) {
++            (Some(l), Some(m)) => format!("{}\n{}", t.msg, loc_name(l, m)),
++            _ => t.msg.clone(),
++        },
++        Fail::Check { message, .. } => message.clone(),
++        Fail::Found => String::new(),
++    }
++}
++
++/// TLC's StringValue#toUnquotedString: the escaped text without the quotes.
++fn unquoted(x: &str) -> String {
++    let q = fmt(&Value::Str(str_id(x)));
++    q[1..q.len() - 1].to_string()
++}
++
++impl Dbg {
++    fn new_id(&self) -> i64 {
++        let i = self.next_id.get();
++        self.next_id.set(if i >= 2_000_000_000 { 1 } else { i + 1 });
++        i
++    }
++
++    fn key(&self, nd: N) -> Option<(u32, usize)> {
++        let m = self.depth.get_or_init(|| {
++            let mut m = HashMap::new();
++            walk_defs(&self.loader.borrow(), &mut |nd, d, def, _| {
++                m.entry(nd as *const Node as usize).or_insert((d, def));
++            });
++            m
++        });
++        m.get(&(nd as *const Node as usize)).copied()
++    }
++
++    /// Takes what the client asked for while the search ran.
++    fn poll(&self, ev: &Evaluator) {
++        let v = self.sh.bp_ver.load(SeqCst);
++        if v != self.bp_ver.get() {
++            self.bp_ver.set(v);
++            let raw = self.sh.ctl.lock().unwrap().bps.clone();
++            let mut m = HashMap::new();
++            for (module, list) in raw {
++                let v: Vec<Bp> = list
++                    .into_iter()
++                    .map(|b| Bp {
++                        line: b.line,
++                        col: b.col.unwrap_or(1),
++                        cond: match b.cond {
++                            Some(c) => Cond::Text(c, RefCell::new(HashMap::new())),
++                            None => Cond::None,
++                        },
++                        hits: b.hit.and_then(|h| h.trim().parse().ok()).unwrap_or(0),
++                    })
++                    .collect();
++                m.insert(module, v);
++            }
++            *self.bps.borrow_mut() = m;
++        }
++        if self.sh.pending.load(Relaxed) != P_NONE {
++            let p = self.sh.pending.swap(P_NONE, SeqCst);
++            self.run_control(ev, p);
++        }
++    }
++
++    fn run_control(&self, ev: &Evaluator, p: u8) {
++        let frames = self.frames.borrow();
++        match p {
++            P_CONTINUE => {
++                self.source.set(None);
++                self.step.set(Step::Continue);
++            }
++            P_IN => self.step.set(Step::In),
++            P_OVER => {
++                let top = frames.last();
++                self.source.set(top.map(|f| f.id));
++                self.source_key.set(top.and_then(|f| self.key(f.node)));
++                self.step.set(Step::Over);
++            }
++            P_OUT => {
++                if frames.len() >= 2 {
++                    let f = &frames[frames.len() - 2];
++                    self.source.set(Some(f.id));
++                    self.source_key.set(self.key(f.node));
++                    self.step.set(Step::Out);
++                }
++            }
++            _ => {
++                // disconnect / terminate
++                self.bps.borrow_mut().clear();
++                self.source.set(None);
++                self.step.set(Step::Continue);
++                if p == P_TERMINATE {
++                    ev.stats.stop_requested.set(true);
++                }
++            }
++        }
++    }
++
++    fn push(&self, ev: &Evaluator, nd: N, ctx: &C, special: Option<Kind>) {
++        self.poll(ev);
++        let init = ev.init_mode.get();
++        let nxt = ev.nxt.borrow().clone();
++        let cur = ev.cur.borrow().clone();
++        let kind = match special {
++            Some(k) => k,
++            None => {
++                if init {
++                    Kind::State
++                } else if nxt.is_some() {
++                    Kind::Action
++                } else if (0..self.nvars).any(|i| !cur.is_undef(i)) {
++                    Kind::State
++                } else {
++                    Kind::Const
++                }
++            }
++        };
++        let level = ev.stats.level.get().max(1);
++        let action = if kind == Kind::Action || kind == Kind::Next {
++            // the action being enumerated: the frame of its expression, right above the next-state frame
++            let frames = self.frames.borrow();
++            let below = match frames.last() {
++                Some(t) if matches!(t.kind, Kind::Action | Kind::Next) => Some(t),
++                _ => frames.iter().rev().find(|f| f.kind == Kind::Action || f.kind == Kind::Next),
++            };
++            match below {
++                Some(f) if f.kind == Kind::Action => f.action,
++                Some(_) => {
++                    let ai = self.actions.iter().position(|a| std::ptr::eq(a.node, nd) && opt_rc_eq(&a.ctx, ctx));
++                    ai.or(self.succ_action.get())
++                }
++                None => self.succ_action.get(),
++            }
++        } else {
++            None
++        };
++        let f = Frame { id: self.new_id(), node: nd, ctx: ctx.clone(), kind, cur, nxt, init, level, action, exit: false, exception: None, name: None };
++        self.frames.borrow_mut().push(f);
++        if self.first.replace(false) {
++            self.halt(ev);
++            return;
++        }
++        if special.is_some() {
++            return;
++        }
++        let halt = match self.step.get() {
++            Step::In => true,
++            Step::Over | Step::Out => self.source.get().is_some() && self.source_key.get().is_some() && self.key(nd) == self.source_key.get(),
++            Step::Continue => false,
++        };
++        if halt || self.breakpoint(ev) {
++            self.halt(ev);
++        }
++    }
++
++    fn pop(&self, ev: &Evaluator) {
++        let top = self.frames.borrow().last().map(|f| f.id);
++        if top.is_some() && top == self.source.get() {
++            self.source.set(None);
++            self.step.set(Step::In);
++            if let Some(f) = self.frames.borrow_mut().last_mut() {
++                f.exit = true;
++            }
++            self.halt(ev);
++            if let Some(f) = self.frames.borrow_mut().last_mut() {
++                f.exit = false;
++            }
++        }
++        self.frames.borrow_mut().pop();
++    }
++
++    fn on_error(&self, ev: &Evaluator, e: &Box<Fail>) {
++        let p = &**e as *const Fail as usize;
++        if !matches!(&**e, Fail::Tla(t) if t.kind == "eval") || self.exc_seen.get() == p {
++            return;
++        }
++        self.exc_seen.set(p);
++        let msg = fail_text(e);
++        let (line, col, src) = {
++            let frames = self.frames.borrow();
++            let f = frames.last().unwrap();
++            (f.node.loc[0], f.node.loc[1], self.source_json(f.node))
++        };
++        self.sh.event("output", Some(obj(vec![("category", s("stderr")), ("output", s(&msg)), ("source", src), ("line", n(line as i64)), ("column", n(col as i64))])));
++        if self.sh.halt_exp.load(SeqCst) {
++            if let Some(f) = self.frames.borrow_mut().last_mut() {
++                f.exception = Some(msg);
++            }
++            self.halt(ev);
++            if let Some(f) = self.frames.borrow_mut().last_mut() {
++                f.exception = None;
++            }
++        }
++    }
++
++    // ---- breakpoints ----
++
++    /// Does a breakpoint fire for the frame just pushed?
++    fn breakpoint(&self, ev: &Evaluator) -> bool {
++        let bps = self.bps.borrow();
++        if bps.is_empty() {
++            return false;
++        }
++        let frames = self.frames.borrow();
++        let top = frames.len() - 1;
++        let f = &frames[top];
++        let module = mod_of(f.node, &self.root);
++        let list = match bps.get(&module) {
++            Some(l) => l,
++            None => return false,
++        };
++        let (line, col) = (f.node.loc[0] as i64, f.node.loc[1] as i64);
++        for bp in list {
++            if bp.line != line || bp.col > col {
++                continue;
++            }
++            // a frame further down the stack that matches the same breakpoint takes it
++            let mut taken = false;
++            for g in frames[..top].iter() {
++                // (TLC's frames of the initial states and of all successors take no source breakpoint)
++                if matches!(g.kind, Kind::Init | Kind::Next) {
++                    continue;
++                }
++                if mod_of(g.node, &self.root) == module && g.node.loc[0] as i64 == bp.line && bp.col <= g.node.loc[1] as i64 && self.fires(ev, g, bp) {
++                    taken = true;
++                    break;
++                }
++            }
++            if !taken && self.fires(ev, f, bp) {
++                return true;
++            }
++        }
++        false
++    }
++
++    /// TLC's TLCStateStackFrame#matches (the location is already known to match).
++    fn fires(&self, ev: &Evaluator, f: &Frame, bp: &Bp) -> bool {
++        if f.kind == Kind::Const {
++            return true;
++        }
++        let mut fire = true;
++        if bp.hits > 0 {
++            let lvl = if f.kind == Kind::Action { f.level + 1 } else { f.level };
++            fire = lvl >= bp.hits;
++        }
++        if let Cond::Text(text, cache) = &bp.cond {
++            let module = mod_of(f.node, &self.root);
++            let names = self.scope_names(&f.ctx);
++            let def = *cache.borrow_mut().entry(names.clone()).or_insert_with(|| self.compile(&module, &names, text).ok());
++            if let Some(def) = def {
++                if let Ok(Value::Bool(b)) = self.eval_in(ev, f, def, &names) {
++                    fire &= b;
++                }
++            }
++        }
++        fire
++    }
++
++    /// The identifiers a debugger expression may use from the frame: the bound identifiers and the
++    /// parameters in its context (not instance substitutions, not operators with arguments).
++    fn scope_names(&self, ctx: &C) -> Vec<Name> {
++        let mut v: Vec<Name> = vec![];
++        let mut c = ctx.as_ref();
++        while let Some(x) = c {
++            if !x.env && matches!(x.val, Bind::Val(_) | Bind::LetLazy { .. }) && !v.contains(&x.name) {
++                v.push(x.name);
++            }
++            c = x.next.as_ref();
++        }
++        v.sort_by_key(|x| x.0);
++        v
++    }
++
++    /// TLC's TLCDebuggerExpression#process: the expression as the body of an operator, whose parameters
++    /// are the names in scope, in a module that extends `module`.
++    fn compile(&self, module: &str, names: &[Name], text: &str) -> Result<&'static Def, bool> {
++        // (named and laid out as TLC does, so that locations in error messages are the same)
++        let k = match self.expr_no.get() {
++            0 => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1),
++            k => k + 1,
++        };
++        self.expr_no.set(k);
++        let mname = format!("__DebuggerModule__{}", k);
++        let oname = format!("__DebuggerExpr__{}", k);
++        let params = if names.is_empty() { String::new() } else { format!("({})", names.iter().map(|x| name_str(*x).to_string()).collect::<Vec<_>>().join(", ")) };
++        let src = format!("---- MODULE {} ----\nEXTENDS {}\n\n{}{} == {}\n====", mname, module, oname, params, text);
++        let mut l = self.loader.borrow_mut();
++        // Err(true): a syntax error
++        let info = l.load_extra(&src, name(&mname)).map_err(|e| matches!(&*e, Fail::Tla(t) if t.kind == "parse"))?;
++        match info.syms.get(name(&oname)) {
++            Some(Sym::Def(d)) => Ok(d),
++            _ => Err(false),
++        }
++    }
++
++    /// Evaluates the debugger expression `def` in frame `f`: its parameters are bound to the values of
++    /// the same names in the frame's context; the states are the frame's.
++    fn eval_in(&self, ev: &Evaluator, f: &Frame, def: &'static Def, names: &[Name]) -> R<Value> {
++        let body = def.body.get().unwrap();
++        let saved = save(ev);
++        ev.set_debug(false);
++        let r = (|| {
++            *ev.cur.borrow_mut() = f.cur.clone();
++            *ev.nxt.borrow_mut() = match f.kind {
++                Kind::Action | Kind::Next => f.nxt.clone(),
++                _ => None,
++            };
++            ev.init_mode.set(f.init);
++            ev.prime_depth.set(0);
++            ev.call_depth.set(0);
++            let mut c: C = None;
++            for nm in names {
++                let v = ev.lookup_value(&f.ctx, *nm, None)?;
++                let v = match &v {
++                    Value::Thunk(t) => ev.force(t)?,
++                    _ => v,
++                };
++                c = cons(*nm, v, &c);
++            }
++            let v = ev.eval(body, &c)?;
++            match v {
++                Value::LazyFcn(lf) => lf.force(ev),
++                v => Ok(v),
++            }
++        })();
++        ev.set_debug(true);
++        restore(ev, saved);
++        r
++    }
++
++    // ---- halting: serve the client until it resumes ----
++
++    fn halt(&self, ev: &Evaluator) {
++        let reason = self.frames.borrow().last().and_then(|f| f.exception.clone());
++        let connected = {
++            let mut c = self.sh.ctl.lock().unwrap();
++            c.halted = true;
++            c.connected
++        };
++        self.vrefs.borrow_mut().clear();
++        self.synth.borrow_mut().clear();
++        if connected {
++            let body = match &reason {
++                Some(t) => obj(vec![("reason", s("exception")), ("threadId", n(0)), ("text", s(t))]),
++                None => obj(vec![("reason", s("")), ("threadId", n(0))]),
++            };
++            self.sh.event("stopped", Some(body));
++        }
++        loop {
++            let req = {
++                let mut c = self.sh.ctl.lock().unwrap();
++                loop {
++                    if let Some(r) = c.queue.pop_front() {
++                        break r;
++                    }
++                    c = self.sh.cv.wait(c).unwrap();
++                }
++            };
++            let cmd = req.get("command").str().unwrap_or("").to_string();
++            let args = req.get("arguments").clone();
++            let resume = match cmd.as_str() {
++                "stackTrace" => {
++                    let b = self.stack_trace(&args);
++                    self.sh.respond(&req, Some(b));
++                    None
++                }
++                "scopes" => {
++                    let b = self.scopes(args.get("frameId").int().unwrap_or(-1));
++                    self.sh.respond(&req, Some(b));
++                    None
++                }
++                "variables" => {
++                    let b = self.variables(ev, args.get("variablesReference").int().unwrap_or(0));
++                    self.sh.respond(&req, Some(b));
++                    None
++                }
++                "evaluate" => {
++                    let b = self.evaluate(ev, &args);
++                    self.sh.respond(&req, Some(b));
++                    None
++                }
++                "continue" => {
++                    self.sh.respond(&req, Some(obj(vec![])));
++                    Some(P_CONTINUE)
++                }
++                "next" => {
++                    self.sh.respond(&req, None);
++                    Some(P_OVER)
++                }
++                "stepIn" => {
++                    self.sh.respond(&req, None);
++                    Some(P_IN)
++                }
++                "stepOut" => {
++                    self.sh.respond(&req, None);
++                    Some(P_OUT)
++                }
++                "disconnect" => {
++                    let mut c = self.sh.ctl.lock().unwrap();
++                    c.bps.clear();
++                    self.sh.bp_ver.fetch_add(1, SeqCst);
++                    drop(c);
++                    self.sh.halt_exp.store(false, SeqCst);
++                    if req.get("_eof").is_null() {
++                        self.sh.respond(&req, None);
++                    }
++                    Some(P_DISCONNECT)
++                }
++                "terminate" => {
++                    let mut c = self.sh.ctl.lock().unwrap();
++                    c.bps.clear();
++                    self.sh.bp_ver.fetch_add(1, SeqCst);
++                    drop(c);
++                    self.sh.halt_exp.store(false, SeqCst);
++                    self.sh.event("terminated", Some(obj(vec![])));
++                    self.sh.respond(&req, None);
++                    Some(P_TERMINATE)
++                }
++                // stepBack / reverseContinue: not supported here; TLC re-evaluates from a parent frame
++                _ => {
++                    self.sh.respond(&req, None);
++                    None
++                }
++            };
++            if let Some(p) = resume {
++                // anything queued behind the resuming request is answered as while running
++                let rest: Vec<J> = {
++                    let mut c = self.sh.ctl.lock().unwrap();
++                    c.halted = false;
++                    c.queue.drain(..).collect()
++                };
++                for r in rest {
++                    not_halted(&self.sh, &r);
++                }
++                self.poll(ev);
++                self.run_control(ev, p);
++                break;
++            }
++        }
++        self.vrefs.borrow_mut().clear();
++        self.synth.borrow_mut().clear();
++    }
++
++    // ---- what a halted run shows ----
++
++    fn source_json(&self, nd: N) -> J {
++        let m = mod_of(nd, &self.root);
++        let path = self.paths.get(&m).cloned().unwrap_or_default();
++        obj(vec![("name", s(&m)), ("path", J::Str(path))])
++    }
++
++    fn frame_json(&self, f: &Frame) -> J {
++        let l = f.node.loc;
++        let module = mod_of(f.node, &self.root);
++        let mut name = match &f.name {
++            Some(x) => x.clone(),
++            None => loc_name(&l, &module),
++        };
++        if f.exception.is_some() {
++            name = format!("(Exception) {}", name);
++        }
++        if f.exit {
++            name = format!("Exit: {}", name);
++        }
++        let mut v = vec![
++            ("ctxtId", n(f.id + 1)),
++            ("id", n(f.id)),
++            ("name", J::Str(name)),
++            ("source", self.source_json(f.node)),
++            ("line", n(l[0] as i64)),
++            ("column", n(l[1] as i64)),
++            ("endLine", n(l[2] as i64)),
++            ("endColumn", n(l[3] as i64 + 1)),
++        ];
++        if f.exit || f.exception.is_some() {
++            v.push(("presentationHint", s("subtle")));
++        }
++        obj(v)
++    }
++
++    /// The label of a trace state: its action (the initial predicate for an initial state).
++    fn step_label(&self, t: &TraceStep) -> String {
++        match t.action {
++            Some(a) if a < self.actions.len() => self.actions[a].label.clone(),
++            _ => self.init_label.clone(),
++        }
++    }
++
++    /// TLC's TLCStateStackFrame#getTraceAsStackFrames for the top frame.
++    fn trace_frames(&self) {
++        let frames = self.frames.borrow();
++        let top = match frames.last() {
++            Some(f) => f,
++            None => return,
++        };
++        if matches!(top.kind, Kind::Const | Kind::Trace) {
++            return;
++        }
++        let trace = self.trace.borrow();
++        let mut out = vec![];
++        let mk = |t: &TraceStep, succ: StateRef, width: usize| {
++            let lvl = trace.iter().position(|x| Rc::ptr_eq(&x.state, &t.state)).map(|p| p + 1).unwrap_or(1);
++            let node = match t.action {
++                Some(a) if a < self.actions.len() => self.actions[a].node,
++                _ => self.init_node.unwrap_or(top.node),
++            };
++            Frame {
++                id: self.new_id(),
++                node,
++                ctx: None,
++                kind: Kind::Trace,
++                cur: t.state.clone(),
++                nxt: Some(succ),
++                init: false,
++                level: lvl as i64,
++                action: t.action,
++                exit: false,
++                exception: None,
++                name: Some(format!("{:0width$}: {}", lvl, self.step_label(t), width = width)),
++            }
++        };
++        let initial = top.init || trace.is_empty();
++        if initial {
++            if top.init && (0..self.nvars).all(|i| !top.cur.is_undef(i)) {
++                let t = TraceStep { state: top.cur.clone(), action: None, id: 0 };
++                let mut f = mk(&t, top.cur.clone(), 1);
++                f.name = Some(format!("1: {}", self.init_label));
++                out.push(f);
++            } else if !top.init && trace.is_empty() && top.kind != Kind::Init {
++                let t = TraceStep { state: top.cur.clone(), action: None, id: 0 };
++                let mut f = mk(&t, top.cur.clone(), 1);
++                f.name = Some(format!("1: {}", self.init_label));
++                out.push(f);
++            }
++        } else {
++            // the states before the frame's state s: s itself for an action frame (whose successor is
++            // being built), and the trace to s otherwise when s is a successor being checked
++            let s_is_cur = matches!(top.kind, Kind::Action | Kind::Next) || trace.last().is_some_and(|t| Rc::ptr_eq(&t.state, &top.cur));
++            let upto = if s_is_cur { trace.len() - 1 } else { trace.len() };
++            if upto == 0 {
++                let t = &trace[0];
++                out.push(mk(t, t.state.clone(), 1));
++            } else {
++                let width = upto.to_string().len();
++                let mut succ = top.cur.clone();
++                for t in trace[..upto].iter().rev() {
++                    out.push(mk(t, succ.clone(), width));
++                    succ = t.state.clone();
++                }
++            }
++        }
++        *self.synth.borrow_mut() = out;
++    }
++
++    fn stack_trace(&self, args: &J) -> J {
++        if self.synth.borrow().is_empty() {
++            self.trace_frames();
++        }
++        let frames = self.frames.borrow();
++        let synth = self.synth.borrow();
++        let all: Vec<&Frame> = frames.iter().rev().chain(synth.iter()).collect();
++        let total = all.len();
++        let mut from = 0;
++        if let Some(st) = args.get("startFrame").int() {
++            if st < 0 || st as usize >= total {
++                return obj(vec![("stackFrames", J::Arr(vec![]))]);
++            }
++            from = st as usize;
++        }
++        let mut to = total;
++        if let Some(lv) = args.get("levels").int() {
++            if lv > 0 && from + (lv as usize) < to {
++                to = from + lv as usize;
++            }
++        }
++        let list: Vec<J> = all[from..to].iter().map(|f| self.frame_json(f)).collect();
++        obj(vec![("stackFrames", J::Arr(list)), ("totalFrames", n(total as i64))])
++    }
++
++    fn with_frame<T>(&self, id: i64, g: impl FnOnce(&Frame) -> T) -> Option<T> {
++        if let Some(f) = self.frames.borrow().iter().find(|f| f.id == id) {
++            return Some(g(f));
++        }
++        if let Some(f) = self.synth.borrow().iter().find(|f| f.id == id) {
++            return Some(g(f));
++        }
++        None
++    }
++
++    fn vref(&self, v: VarSrc) -> i64 {
++        let mut t = self.vrefs.borrow_mut();
++        t.push(v);
++        t.len() as i64
++    }
++
++    fn ctx_entries(&self, ev: &Evaluator, ctx: &C) -> Vec<(String, Result<Value, String>)> {
++        let mut out = vec![];
++        let mut c = ctx.as_ref();
++        while let Some(x) = c {
++            let nm = name_str(x.name).to_string();
++            match &x.val {
++                Bind::Val(v) => {
++                    let r = match v {
++                        Value::Thunk(t) => ev.force(t).map_err(|e| fail_text(&e)),
++                        v => Ok(v.clone()),
++                    };
++                    out.push((nm, r));
++                }
++                Bind::LetLazy { .. } => {
++                    out.push((nm.clone(), ev.lookup_value(ctx, x.name, None).map_err(|e| fail_text(&e))));
++                }
++                _ => {}
++            }
++            c = x.next.as_ref();
++        }
++        out
++    }
++
++    fn scopes(&self, id: i64) -> J {
++        let r = self.with_frame(id, |f| {
++            let mut v = vec![];
++            if f.ctx.is_some() && f.kind != Kind::Trace {
++                v.push(obj(vec![("name", s("Context")), ("variablesReference", n(self.vref(VarSrc::Ctx(id)))), ("expensive", J::Bool(false))]));
++            }
++            if !self.consts.is_empty() || !self.const_defs.is_empty() {
++                v.push(obj(vec![("name", s("Constants")), ("presentationHint", s("registers")), ("variablesReference", n(self.vref(VarSrc::Constants))), ("expensive", J::Bool(false))]));
++            }
++            if f.kind != Kind::Const {
++                let nm = if f.kind == Kind::Action { "Action" } else { "State" };
++                v.push(obj(vec![("name", s(nm)), ("variablesReference", n(self.vref(VarSrc::State(id)))), ("expensive", J::Bool(false))]));
++                v.push(obj(vec![("name", s("Trace")), ("variablesReference", n(self.vref(VarSrc::Trace(id)))), ("expensive", J::Bool(false))]));
++            }
++            J::Arr(v)
++        });
++        match r {
++            Some(a) => obj(vec![("scopes", a)]),
++            None => obj(vec![]),
++        }
++    }
++
++    /// TLC's Value#toTLCVariable at the top of a list: strings without quotes.
++    fn top_var(&self, ev: &Evaluator, name: &str, v: &Value) -> J {
++        let v = self.forced(ev, v);
++        let value = match &v {
++            Value::Str(x) => unquoted(&str_of(*x)),
++            _ => self.show(ev, &v),
++        };
++        self.var_json(name, value, &v)
++    }
++    fn var_json(&self, name: &str, value: String, v: &Value) -> J {
++        let r = if expandable(v) { self.vref(VarSrc::Value(v.clone())) } else { 0 };
++        obj(vec![("name", s(name)), ("value", J::Str(value)), ("type", s(&type_string(v))), ("variablesReference", n(r))])
++    }
++    fn forced(&self, ev: &Evaluator, v: &Value) -> Value {
++        match v {
++            Value::Thunk(t) => ev.force(t).unwrap_or_else(|_| v.clone()),
++            v => v.clone(),
++        }
++    }
++    fn show(&self, ev: &Evaluator, v: &Value) -> String {
++        match v {
++            Value::LazyFcn(f) => match f.force(ev) {
++                Ok(x) => fmt(&x),
++                Err(_) => f.show(ev),
++            },
++            v => fmt(v),
++        }
++    }
++
++    /// The value of a state as TLC's RecordValue(state[, successor], "?") prints it.
++    fn state_record(&self, st0: &StateRef, t: Option<&StateRef>) -> String {
++        let mut o = String::from("[");
++        for (i, nm) in self.vars.iter().enumerate() {
++            if i > 0 {
++                o.push_str(", ");
++            }
++            let val = |st: &StateRef| if st.is_undef(i) { "?".to_string() } else { fmt(&st.get(i)) };
++            match t {
++                None => {
++                    o.push_str(nm);
++                    o.push_str(" |-> ");
++                    o.push_str(&val(st0));
++                }
++                Some(t) => {
++                    o.push_str(&format!("{}  |-> {}, {}' |-> {}", nm, val(st0), nm, val(t)));
++                }
++            }
++        }
++        o.push(']');
++        o
++    }
++    fn state_var(&self, name: String, st0: &StateRef, t: Option<&StateRef>) -> J {
++        let mut fields: Vec<(String, Option<Value>)> = vec![];
++        for (i, nm) in self.vars.iter().enumerate() {
++            let get = |st: &StateRef| if st.is_undef(i) { None } else { Some(st.get(i)) };
++            match t {
++                None => fields.push((nm.clone(), get(st0))),
++                Some(t) => {
++                    fields.push((format!("{} ", nm), get(st0)));
++                    fields.push((format!("{}'", nm), get(t)));
++                }
++            }
++        }
++        let r = self.vref(VarSrc::Fields(fields.iter().map(|(k, v)| (k.clone(), v.clone().unwrap_or(Value::Undef))).collect()));
++        obj(vec![
++            ("__vscodeVariableMenuContext", s("state")),
++            ("name", J::Str(name)),
++            ("value", J::Str(self.state_record(st0, t))),
++            ("type", s("State")),
++            ("variablesReference", n(r)),
++        ])
++    }
++
++    fn variables(&self, ev: &Evaluator, r: i64) -> J {
++        let src = {
++            let t = self.vrefs.borrow();
++            if r <= 0 || r as usize > t.len() {
++                return obj(vec![("variables", J::Arr(vec![]))]);
++            }
++            match &t[r as usize - 1] {
++                VarSrc::Value(v) => VarSrc::Value(v.clone()),
++                VarSrc::Ctx(i) => VarSrc::Ctx(*i),
++                VarSrc::Constants => VarSrc::Constants,
++                VarSrc::ConstGroup(g) => VarSrc::ConstGroup(g.clone()),
++                VarSrc::Fields(g) => VarSrc::Fields(g.clone()),
++                VarSrc::State(i) => VarSrc::State(*i),
++                VarSrc::Trace(i) => VarSrc::Trace(*i),
++            }
++        };
++        let saved = save(ev);
++        ev.set_debug(false);
++        let mut sorted = true;
++        let list: Vec<J> = match src {
++            VarSrc::Value(v) => self.children(ev, &v),
++            VarSrc::ConstGroup(g) => g.iter().map(|(k, v)| self.top_var(ev, k, v)).collect(),
++            VarSrc::Fields(g) => g
++                .iter()
++                .map(|(k, v)| {
++                    if matches!(v, Value::Undef) {
++                        obj(vec![("name", s(k)), ("value", s("?")), ("type", s("Evaluation pending... (value has not been determined yet)")), ("variablesReference", n(0))])
++                    } else {
++                        let v = self.forced(ev, v);
++                        self.var_json(k, self.show(ev, &v), &v)
++                    }
++                })
++                .collect(),
++            VarSrc::Ctx(id) => {
++                let e = self.with_frame(id, |f| {
++                    *ev.cur.borrow_mut() = f.cur.clone();
++                    *ev.nxt.borrow_mut() = f.nxt.clone();
++                    ev.init_mode.set(f.init);
++                    self.ctx_entries(ev, &f.ctx)
++                });
++                e.unwrap_or_default()
++                    .into_iter()
++                    .map(|(k, r)| match r {
++                        Ok(v) => self.top_var(ev, &k, &v),
++                        Err(m) => obj(vec![("name", s(&k)), ("value", s("<error>")), ("type", J::Str(m)), ("variablesReference", n(0))]),
++                    })
++                    .collect()
++            }
++            VarSrc::Constants => {
++                let mut items: Vec<(String, Value)> = vec![];
++                for (d, nm) in &self.consts {
++                    if let Some(v) = d.value.borrow().as_ref() {
++                        items.push((nm.clone(), v.clone()));
++                    }
++                }
++                for d in &self.const_defs {
++                    if let Some(v) = d.cache.borrow().as_ref() {
++                        let nm = d.name.to_string();
++                        if !items.iter().any(|(k, _)| *k == nm) {
++                            items.push((nm, v.clone()));
++                        }
++                    }
++                }
++                let g = self.vref(VarSrc::ConstGroup(items));
++                // (TLC: the value is the path name of a definition of the group, or the module's name)
++                let value = if self.const_defs.is_empty() { self.root.clone() } else { String::new() };
++                vec![obj(vec![("name", s(&self.root)), ("value", J::Str(value)), ("variablesReference", n(g))])]
++            }
++            VarSrc::State(id) => {
++                sorted = false;
++                self.with_frame(id, |f| {
++                    let t = if f.kind == Kind::Action { f.nxt.as_ref() } else { None };
++                    let (lvl, act) = if f.kind == Kind::Action { (f.level + 1, f.action) } else { (f.level, if f.init { None } else { f.action }) };
++                    let label = match act {
++                        Some(a) if a < self.actions.len() => self.actions[a].label.clone(),
++                        _ if f.kind == Kind::Trace => self.init_label.clone(),
++                        _ => "<???>".to_string(),
++                    };
++                    vec![self.state_var(format!("{}: {}", lvl, label), &f.cur, t)]
++                })
++                .unwrap_or_default()
++            }
++            VarSrc::Trace(id) => {
++                sorted = false;
++                self.with_frame(id, |f| self.trace_vars(f)).unwrap_or_default()
++            }
++        };
++        ev.set_debug(true);
++        restore(ev, saved);
++        let list = if sorted { sort_vars(list) } else { list };
++        obj(vec![("variables", J::Arr(list))])
++    }
++
++    /// TLC's Trace scope: the frame's state and the states before it, the latest first.
++    fn trace_vars(&self, f: &Frame) -> Vec<J> {
++        let trace = self.trace.borrow();
++        let initial = |st: &StateRef, lbl: String| self.state_var(format!("1: {}", lbl), st, None);
++        if f.init || f.kind == Kind::Init {
++            return vec![initial(&f.cur, "<Initial predicate>".to_string())];
++        }
++        let upto = match f.kind {
++            Kind::Trace => trace.iter().position(|t| Rc::ptr_eq(&t.state, &f.cur)).map(|p| p + 1).unwrap_or(0),
++            Kind::Action | Kind::Next => trace.len(),
++            _ => {
++                if trace.last().is_some_and(|t| Rc::ptr_eq(&t.state, &f.cur)) {
++                    trace.len()
++                } else {
++                    // a successor being checked: itself, then the trace to its predecessor
++                    let mut v = vec![self.state_var(format!("{}: {}", trace.len() + 1, self.succ_label()), &f.cur, None)];
++                    for (i, t) in trace.iter().enumerate().rev() {
++                        v.push(self.state_var(format!("{}: {}", i + 1, self.step_label(t)), &t.state, None));
++                    }
++                    if trace.is_empty() {
++                        return vec![initial(&f.cur, self.init_label.clone())];
++                    }
++                    return v;
++                }
++            }
++        };
++        if upto == 0 {
++            return vec![initial(&f.cur, self.init_label.clone())];
++        }
++        trace[..upto].iter().enumerate().rev().map(|(i, t)| self.state_var(format!("{}: {}", i + 1, self.step_label(t)), &t.state, None)).collect()
++    }
++    fn succ_label(&self) -> String {
++        match self.succ_action.get() {
++            Some(a) if a < self.actions.len() => self.actions[a].label.clone(),
++            _ => "<???>".to_string(),
++        }
++    }
++
++    /// TLC's Value#getTLCVariables.
++    fn children(&self, ev: &Evaluator, v: &Value) -> Vec<J> {
++        let nested = |nm: String, x: &Value| {
++            let x = self.forced(ev, x);
++            self.var_json(&nm, self.show(ev, &x), &x)
++        };
++        match v {
++            Value::Record(r) => (0..r.names.len()).map(|i| nested(str_of(r.names[i]).to_string(), &r.vals[i])).collect(),
++            Value::Fcn(f) => (0..f.dom.len()).map(|i| nested(fmt(&f.dom[i]), &f.vals[i])).collect(),
++            Value::Tuple(t) => {
++                let w = t.len().to_string().len();
++                t.iter().enumerate().map(|(i, x)| nested(format!("{:0w$}", i + 1, w = w), x)).collect()
++            }
++            Value::Set(st) => match st.elems() {
++                Ok(es) => es.iter().map(|x| self.top_var(ev, &fmt(x), x)).collect(),
++                Err(_) => vec![],
++            },
++            _ => vec![],
++        }
++    }
++
++    fn evaluate(&self, ev: &Evaluator, args: &J) -> J {
++        let expr = args.get("expression").str().unwrap_or("").to_string();
++        let ctxk = args.get("context").str().unwrap_or("");
++        if ctxk == "variables" {
++            return obj(vec![("result", J::Str(expr)), ("variablesReference", n(0))]);
++        }
++        if !matches!(ctxk, "watch" | "repl" | "clipboard" | "hover" | "") {
++            return obj(vec![("variablesReference", n(0))]);
++        }
++        let id = args.get("frameId").int().unwrap_or(-1);
++        let r = self.with_frame(id, |f| {
++            if expr.trim().is_empty() {
++                return obj(vec![("result", J::Str(expr.clone())), ("variablesReference", n(0))]);
++            }
++            // TLC: an expression in the scope of the root module and of the frame's identifiers
++            let module = mod_of(f.node, &self.root);
++            let names = self.scope_names(&f.ctx);
++            let res = match self.compile(&self.root, &names, &expr) {
++                Err(true) => Err(format!("Syntax error while parsing breakpoint expression \"{}\"", expr)),
++                Err(false) => Err(format!("{}\n\nSemantic error while parsing breakpoint expression \"{}\"", loc_name(&f.node.loc, &module), expr)),
++                Ok(def) => self.eval_in(ev, f, def, &names).map_err(|e| fail_text(&e)),
++            };
++            let saved = save(ev);
++            ev.set_debug(false);
++            let j = match res {
++                Ok(v) => {
++                    let v = self.forced(ev, &v);
++                    let value = match &v {
++                        Value::Str(x) => unquoted(&str_of(*x)),
++                        _ => self.show(ev, &v),
++                    };
++                    let r = if expandable(&v) { self.vref(VarSrc::Value(v.clone())) } else { 0 };
++                    obj(vec![("result", J::Str(value)), ("variablesReference", n(r))])
++                }
++                Err(m) => obj(vec![("result", J::Str(unquoted(&m))), ("variablesReference", n(0))]),
++            };
++            ev.set_debug(true);
++            restore(ev, saved);
++            j
++        });
++        r.unwrap_or_else(|| obj(vec![("variablesReference", n(0))]))
++    }
++}
++
++/// A reference to a definition that the model made from a name in the configuration: it has the location
++/// of the definition itself.
++fn synthetic(nd: N) -> bool {
++    match &nd.e {
++        E::App { args, r, .. } if args.is_empty() => matches!(r.get(), Res::Def(d) if d.loc == nd.loc),
++        _ => false,
++    }
++}
++
++fn is_ident(x: &str) -> bool {
++    x.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') && x.bytes().any(|c| c.is_ascii_alphabetic())
++}
++
++fn opt_rc_eq(a: &C, b: &C) -> bool {
++    match (a, b) {
++        (None, None) => true,
++        (Some(x), Some(y)) => Rc::ptr_eq(x, y),
++        _ => false,
++    }
++}
++
++fn expandable(v: &Value) -> bool {
++    match v {
++        Value::Record(_) | Value::Fcn(_) | Value::Tuple(_) => true,
++        Value::Set(st) => st.enumerable() && !matches!(st.k, SetK::Inf(_) | SetK::Any),
++        _ => false,
++    }
++}
++
++/// TLC's Value#getTypeString for the value's TLC class.
++fn type_string(v: &Value) -> String {
++    let (c, k) = match v {
++        Value::Undef => ("UndefValue", "an undefined value"),
++        Value::Bool(_) => ("BoolValue", "a Boolean value"),
++        Value::Int(_) => ("IntValue", "an integer"),
++        Value::Str(_) => ("StringValue", "a string"),
++        Value::Model(_) => ("ModelValue", "a model value"),
++        Value::Tuple(_) => ("TupleValue", "a tuple"),
++        // a function with a domain of strings that are not all identifiers is not one of TLC's records
++        Value::Record(r) if r.names.iter().all(|x| is_ident(&str_of(*x))) => ("RecordValue", "a record"),
++        Value::Record(_) => ("FcnRcdValue", "a function  of the form (d1 :> e1 @@ ... @@ dN :> eN)"),
++        Value::Fcn(_) => ("FcnRcdValue", "a function  of the form (d1 :> e1 @@ ... @@ dN :> eN)"),
++        Value::LazyFcn(_) => ("FcnLambdaValue", "a function of the form  [x \\in S |-> expr]"),
++        Value::Closure(_) | Value::DefRef(_) | Value::Thunk(_) => ("OpLambdaValue", "an operator"),
++        Value::Set(st) => match &st.k {
++            SetK::Interval(..) => ("IntervalValue", "a set of the form i..j"),
++            SetK::Subset(_) => ("SubsetValue", "a set of the form SUBSET S"),
++            SetK::FcnSet(..) => ("SetOfFcnsValue", "a set of the form [S -> T]"),
++            SetK::RecSet(..) => ("SetOfRcdsValue", "a set of the form [d1 : S1, ... , dN : SN]"),
++            SetK::Cross(_) => ("SetOfTuplesValue", "a cartesian product"),
++            SetK::Inf(_) | SetK::Any => ("UserValue", "a special set constant"),
++            _ => ("SetEnumValue", "a set of the form {e1, ... ,eN}"),
++        },
++    };
++    format!("{}: {}", c, k)
++}
++
++/// TLC's toSortedDistinctArray: by name, then type, then value; duplicates dropped.
++fn sort_vars(v: Vec<J>) -> Vec<J> {
++    let key = |j: &J| (j.get("name").str().unwrap_or("").encode_utf16().collect::<Vec<u16>>(), j.get("type").str().unwrap_or("").to_string(), j.get("value").str().unwrap_or("").to_string());
++    let mut v: Vec<(_, J)> = v.into_iter().map(|j| (key(&j), j)).collect();
++    v.sort_by(|a, b| a.0.cmp(&b.0));
++    v.dedup_by(|a, b| a.0 == b.0);
++    v.into_iter().map(|x| x.1).collect()
++}
+diff --git a/src/eval.rs b/src/eval.rs
+index 163d46f..71fc799 100644
+--- a/src/eval.rs
++++ b/src/eval.rs
+@@ -466,6 +466,8 @@ pub struct Evaluator {
+     /// `tracing`, or the read tracker of stepstats.rs is on: `eval` then takes its instrumented path. The
+     /// one flag ordinary evaluation tests.
+     pub hooked: Cell<bool>,
++    /// `-debugger`: every evaluation and enumeration step is a frame of the debugger (dap.rs)
++    pub dbg: Cell<bool>,
+     pub trace_stack: RefCell<Vec<N>>,
+     /// lazily built records for TLCGet("spec")
+     pub spec_info: RefCell<Option<Box<dyn Fn() -> R<Value>>>>,
+@@ -517,6 +519,7 @@ impl Evaluator {
+             host: RefCell::new(Rc::new(crate::host::NullHost)),
+             tracing: Cell::new(false),
+             hooked: Cell::new(false),
++            dbg: Cell::new(false),
+             trace_stack: RefCell::new(Vec::new()),
+             spec_info: RefCell::new(None),
+             rng: Cell::new(0x9E3779B97F4A7C15),
+@@ -531,11 +534,15 @@ impl Evaluator {
+ 
+     pub fn set_tracing(&self, on: bool) {
+         self.tracing.set(on);
+-        self.hooked.set(on || self.steps.on.get());
++        self.hooked.set(on || self.steps.on.get() || self.dbg.get());
+     }
+     pub(crate) fn set_steps_on(&self, on: bool) {
+         self.steps.on.set(on);
+-        self.hooked.set(on || self.tracing.get());
++        self.hooked.set(on || self.tracing.get() || self.dbg.get());
++    }
++    pub fn set_debug(&self, on: bool) {
++        self.dbg.set(on);
++        self.hooked.set(on || self.tracing.get() || self.steps.on.get());
+     }
+     pub fn fail<T>(&self, msg: String, n: N) -> R<T> {
+         Err(Box::new(Fail::Tla(TlaError { msg, loc: Some(n.loc), module: n.module_str(), kind: "eval" })))
+@@ -1402,10 +1409,21 @@ impl Evaluator {
+     #[cold]
+     #[inline(never)]
+     fn eval_hooked(&self, n: N, ctx: &C) -> R<Value> {
++        #[cfg(not(target_arch = "wasm32"))]
++        if self.dbg.get() {
++            return crate::dap::eval_hook(self, n, ctx);
++        }
++        self.eval_hooked_plain(n, ctx)
++    }
++    /// `eval_hooked` without the debugger.
++    pub(crate) fn eval_hooked_plain(&self, n: N, ctx: &C) -> R<Value> {
+         if self.tracing.get() {
+             return self.eval_traced(n, ctx);
+         }
+-        self.eval_steps(n, ctx)
++        if self.steps.on.get() {
++            return self.eval_steps(n, ctx);
++        }
++        self.eval_inner(n, ctx)
+     }
+     #[cold]
+     #[inline(never)]
+@@ -2609,7 +2627,15 @@ impl Evaluator {
+ 
+     /// Enumerate all ways of satisfying `e`, assigning unassigned target variables (primed variables in
+     /// next-state mode, unprimed variables in init mode). Calls k for each satisfying (partial) assignment.
++    #[inline]
+     pub fn enumerate(&self, e: N, ctx: &C, k: &mut dyn FnMut() -> R<()>) -> R<()> {
++        #[cfg(not(target_arch = "wasm32"))]
++        if self.dbg.get() {
++            return crate::dap::enum_hook(self, e, ctx, k);
++        }
++        self.enumerate_inner(e, ctx, k)
++    }
++    pub(crate) fn enumerate_inner(&self, e: N, ctx: &C, k: &mut dyn FnMut() -> R<()>) -> R<()> {
+         // Like TLC: once every variable is assigned, the remaining conjuncts are plain predicates.
+         if self.n_assigned.get() == self.nvars.get() as i64 && !e.is_k(K::Cdot) {
+             if self.eval_bool(e, ctx)? {
+diff --git a/src/lib.rs b/src/lib.rs
+index 0673519..3f6b6c7 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,6 +8,8 @@ pub mod cli;
+ pub mod community;
+ pub mod compile;
+ pub mod conform;
++#[cfg(not(target_arch = "wasm32"))]
++pub mod dap;
+ pub mod eval;
+ pub mod host;
+ pub mod intern;
+diff --git a/src/model.rs b/src/model.rs
+index 9890d58..1ef10b1 100644
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -51,6 +51,8 @@ pub struct Model {
+     pub alias: Option<Pred>,
+     pub postconditions: Vec<PostCond>,
+     pub check_deadlock: bool,
++    /// the next-state relation as the specification names it (the debugger's frame of all successors)
++    pub next_pred: Option<N>,
+ }
+ 
+ fn config_err<T>(msg: String) -> R<T> {
+@@ -610,6 +612,7 @@ pub fn build_model(root_name: &str, resolve: SourceResolver, cfg: &Config, host:
+     }
+ 
+     // ---- split Next into actions ----
++    let next_node = b.next_pred.as_ref().map(|p| p.0);
+     if let Some((e, ctx, nm)) = b.next_pred.take() {
+         let nm = if nm.is_empty() { "Action".to_string() } else { nm };
+         b.split(e, &ctx, &nm, None, root_name)?;
+@@ -713,6 +716,7 @@ pub fn build_model(root_name: &str, resolve: SourceResolver, cfg: &Config, host:
+         alias,
+         postconditions,
+         check_deadlock: cfg.check_deadlock.unwrap_or(true),
++        next_pred: next_node,
+     })
+ }
+ 
+diff --git a/src/modules.rs b/src/modules.rs
+index 8fbdff5..1ce5a6b 100644
+--- a/src/modules.rs
++++ b/src/modules.rs
+@@ -271,6 +271,14 @@ impl Loader {
+         Ok(info)
+     }
+ 
++    /// Parses and resolves a module that is not loaded by name (the debugger's expressions); the modules it
++    /// extends must be loaded already.
++    #[cfg(not(target_arch = "wasm32"))]
++    pub(crate) fn load_extra(&mut self, src: &str, name: Name) -> R<Rc<ModuleInfo>> {
++        let ast: &'static ModuleNode = leak(parse_module(src, &name_str(name))?);
++        Ok(Rc::new(self.process(ast, None)?))
++    }
++
+     fn process(&mut self, ast: &'static ModuleNode, outer: Option<&ModuleInfo>) -> R<ModuleInfo> {
+         let mut info = ModuleInfo { name: Some(ast.name), ..Default::default() };
+         if let Some(o) = outer {

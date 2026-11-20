@@ -664,6 +664,90 @@ index 39d912fc..1e6c52ed 100644
  
          if config_file:
              cmd.extend(["-config", config_file])
+diff --git a/tools/trace_debugger/src/executor/tlc_process.py b/tools/trace_debugger/src/executor/tlc_process.py
+index 3a173b52..d7e06e2c 100644
+--- a/tools/trace_debugger/src/executor/tlc_process.py
++++ b/tools/trace_debugger/src/executor/tlc_process.py
+@@ -4,6 +4,22 @@ import subprocess
+ import threading
+ import time
+ 
++
++def _everystate_binary(root: str | None = None) -> str | None:
++    """The everystate binary (the pure-Rust TLC replacement installed by Statehound), or None.
++
++    Looked up in STATEHOUND_EVERYSTATE, then <root>/bin/everystate, then PATH."""
++    import shutil
++
++    for candidate in (
++        os.environ.get("STATEHOUND_EVERYSTATE"),
++        os.path.join(root, "bin", "everystate") if root else None,
++        shutil.which("everystate"),
++    ):
++        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
++            return candidate
++    return None
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -32,7 +48,8 @@ class TLCExecutor:
+ 
+                     cmdline_str = " ".join(cmdline)
+                     # Check if it's a TLC debugger process on our port
+-                    if "tlc2.TLC" in cmdline_str and "-debugger" in cmdline_str and f"port={port}" in cmdline_str:
++                    is_checker = "tlc2.TLC" in cmdline_str or os.path.basename(cmdline[0]) == "everystate"
++                    if is_checker and "-debugger" in cmdline_str and f"port={port}" in cmdline_str:
+                         logger.warning(f"Found zombie TLC process (PID {proc.pid}), killing...")
+                         proc.kill()
+                         proc.wait(timeout=3)
+@@ -51,6 +68,9 @@ class TLCExecutor:
+                 subprocess.run(
+                     ["pkill", "-9", "-f", f"tlc2.TLC.*-debugger.*port={port}"], stderr=subprocess.DEVNULL, check=False
+                 )
++                subprocess.run(
++                    ["pkill", "-9", "-f", f"everystate.*-debugger.*port={port}"], stderr=subprocess.DEVNULL, check=False
++                )
+                 time.sleep(0.5)
+             except Exception as e:
+                 logger.warning(f"Could not cleanup zombie processes: {e}")
+@@ -64,19 +84,23 @@ class TLCExecutor:
+         if trace_file:
+             env["JSON"] = trace_file
+ 
+-        cmd = [
+-            "java",
+-            "-XX:+UseParallelGC",
+-            "-Xmx4G",
+-            "-cp",
+-            classpath,
+-            "tlc2.TLC",
+-            "-debugger",
+-            f"port={port}",
+-            "-config",
+-            config_file,
+-            spec_file,
+-        ]
++        everystate = _everystate_binary(os.environ.get("SPECULAR_ROOT") or os.path.dirname(os.path.dirname(self.tla_jar_path)))
++        if everystate:
++            cmd = [everystate, "-debugger", f"port={port}", "-config", config_file, spec_file]
++        else:
++            cmd = [
++                "java",
++                "-XX:+UseParallelGC",
++                "-Xmx4G",
++                "-cp",
++                classpath,
++                "tlc2.TLC",
++                "-debugger",
++                f"port={port}",
++                "-config",
++                config_file,
++                spec_file,
++            ]
+ 
+         logger.info(f"Launching TLC: {' '.join(cmd)}")
+         self.process = subprocess.Popen(
 diff --git a/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py b/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py
 index 916cc7b9..39c565ae 100644
 --- a/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py

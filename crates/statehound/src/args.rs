@@ -134,7 +134,9 @@ pub fn parse(argv: &[String]) -> Invocation {
             }
             "-continue" => inv.unsupported = inv.unsupported.or(Some("-continue")),
             "-debugger" => {
-                inv.unsupported.get_or_insert("-debugger");
+                // interactive: decided by the exhaustive search alone, never cached
+                inv.no_hunters = true;
+                inv.writes_files = true;
                 if let Some(v) = argv.get(i + 1) {
                     if !v.starts_with('-') && !v.ends_with(".tla") && v.contains('=') {
                         inv.tlc_args.push(v.clone());
@@ -185,7 +187,9 @@ mod tests {
         assert_eq!(d.tlc_args, v("-config a.cfg a.tla -dumpTrace json t.json"));
         assert!(parse(&v("-config a.cfg a.tla -dumptrace json t.json")).unsupported.is_none());
         assert!(parse(&v("-config a.cfg a.tla -continue")).unsupported.is_some());
-        assert!(parse(&v("-config a.cfg a.tla -debugger nosuspend,port=4712")).unsupported.is_some());
+        let g = parse(&v("-config a.cfg a.tla -debugger nosuspend,port=4712"));
+        assert!(g.unsupported.is_none() && g.no_hunters && g.writes_files);
+        assert_eq!(g.tlc_args, v("-config a.cfg a.tla -debugger nosuspend,port=4712"));
         assert!(parse(&v("-config a.cfg a.tla -loadTrace json t.json")).no_hunters);
         assert!(parse(&v("-config a.cfg a.tla -frobnicate")).unsupported.is_some());
     }
