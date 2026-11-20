@@ -1,0 +1,32 @@
+flowchart TD
+    S0["counter=0<br/>p1:R p2:R<br/>tmp=0,0"]
+    S1["counter=0<br/>p1:W p2:R<br/>tmp=0,0"]
+    S2["counter=0<br/>p1:R p2:W<br/>tmp=0,0"]
+    S3["counter=1<br/>p1:D p2:R<br/>tmp=0,0"]
+    S4["counter=0<br/>p1:W p2:W<br/>tmp=0,0"]
+    S5["counter=1<br/>p1:R p2:D<br/>tmp=0,0"]
+    S6["counter=1<br/>p1:D p2:W<br/>tmp=0,1"]
+    S7["counter=1<br/>p1:D p2:W<br/>tmp=0,0"]
+    S8["counter=1<br/>p1:W p2:D<br/>tmp=0,0"]
+    S9["counter=1<br/>p1:W p2:D<br/>tmp=1,0"]
+    S10["counter=2<br/>p1:D p2:D<br/>tmp=0,1"]
+    S11["counter=1<br/>p1:D p2:D<br/>tmp=0,0"]
+    S12["counter=2<br/>p1:D p2:D<br/>tmp=1,0"]
+    S0 -->|"Read(p1)"| S1
+    S0 -->|"Read(p2)"| S2
+    S1 -->|"Write(p1)"| S3
+    S1 -->|"Read(p2)"| S4
+    S2 -->|"Read(p1)"| S4
+    S2 -->|"Write(p2)"| S5
+    S3 -->|"Read(p2)"| S6
+    S4 -->|"Write(p1)"| S7
+    S4 -->|"Write(p2)"| S8
+    S5 -->|"Read(p1)"| S9
+    S6 -->|"Write(p2)"| S10
+    S7 -->|"Write(p2)"| S11
+    S8 -->|"Write(p1)"| S11
+    S9 -->|"Write(p1)"| S12
+    classDef bad fill:#f8d7da,stroke:#b02a37,color:#58151c
+    classDef good fill:#d1e7dd,stroke:#146c43,color:#0a3622
+    class S11 bad
+    class S10,S12 good

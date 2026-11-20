@@ -1,0 +1,646 @@
+diff --git a/scripts/infra/bundle_lite.py b/scripts/infra/bundle_lite.py
+index 31d608e2..59e2c43a 100644
+--- a/scripts/infra/bundle_lite.py
++++ b/scripts/infra/bundle_lite.py
+@@ -14,6 +14,7 @@ SKILLS = ("code_analysis", "spec_generation", "tla-checking-workflow", "bug-conf
+ READER_FILES = (
+     "__init__.py",
+     "cli.py",
++    "handler_plugin.py",
+     "tlc_output_reader.py",
+     "trace_reader.py",
+     "utils/__init__.py",
+diff --git a/scripts/infra/setup.sh b/scripts/infra/setup.sh
+index eea2c533..9fb18fd0 100755
+--- a/scripts/infra/setup.sh
++++ b/scripts/infra/setup.sh
+@@ -267,6 +267,17 @@ COPILOT_USER_CONFIG_DIR="${COPILOT_HOME:-$HOME/.copilot}"
+ 
+ print_status "Project root: $PROJECT_ROOT"
+ 
++# Statehound (pure Rust) replaces Java TLC and the Java CFA tool when its binaries are installed in
++# bin/ (statehound's scripts/install.sh --pipeline puts them there). Java is then not needed at all.
++RUST_CHECKER=false
++if [[ -x "$PROJECT_ROOT/bin/statehound" && -x "$PROJECT_ROOT/bin/everystate" ]]; then
++  RUST_CHECKER=true
++fi
++RUST_CFA=false
++if [[ -x "$PROJECT_ROOT/bin/tla-cfa" ]]; then
++  RUST_CFA=true
++fi
++
+ # ─── Prerequisites ───────────────────────────────────────────────────────────
+ 
+ if ! command_exists python3; then
+@@ -275,11 +286,14 @@ if ! command_exists python3; then
+ fi
+ print_success "Python found: $(python3 --version 2>&1)"
+ 
+-if ! command_exists java; then
+-  print_error "Java is required but not found"
++if [[ "$RUST_CHECKER" == true && "$RUST_CFA" == true ]]; then
++  print_success "Statehound found in bin/: Java is not needed"
++elif ! command_exists java; then
++  print_error "Java is required but not found (or install Statehound for a Java-free toolchain)"
+   exit 1
++else
++  print_success "Java found: $(java -version 2>&1 | head -n1)"
+ fi
+-print_success "Java found: $(java -version 2>&1 | head -n1)"
+ 
+ if ! command_exists pip3; then
+   print_error "pip3 is required but not found"
+@@ -287,49 +301,53 @@ if ! command_exists pip3; then
+ fi
+ print_success "pip3 found"
+ 
+-# ─── TLA+ JARs ──────────────────────────────────────────────────────────────
++# ─── TLA+ JARs (only for Java TLC) ──────────────────────────────────────────
+ 
+-mkdir -p "$PROJECT_ROOT/lib"
++if [[ "$RUST_CHECKER" == true ]]; then
++  print_success "Using statehound/everystate from bin/; skipping the TLA+ jars"
++else
++  mkdir -p "$PROJECT_ROOT/lib"
+ 
+-print_status "Setting up TLA+ jars..."
++  print_status "Setting up TLA+ jars..."
+ 
+-if [[ ! -f "$PROJECT_ROOT/lib/tla2tools.jar" ]]; then
+-  TLA_TOOLS_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar"
+-  print_status "Downloading tla2tools.jar..."
+-  if command_exists wget; then
+-    wget -O "$PROJECT_ROOT/lib/tla2tools.jar" "$TLA_TOOLS_URL"
+-  elif command_exists curl; then
+-    curl -L -o "$PROJECT_ROOT/lib/tla2tools.jar" "$TLA_TOOLS_URL"
++  if [[ ! -f "$PROJECT_ROOT/lib/tla2tools.jar" ]]; then
++    TLA_TOOLS_URL="https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar"
++    print_status "Downloading tla2tools.jar..."
++    if command_exists wget; then
++      wget -O "$PROJECT_ROOT/lib/tla2tools.jar" "$TLA_TOOLS_URL"
++    elif command_exists curl; then
++      curl -L -o "$PROJECT_ROOT/lib/tla2tools.jar" "$TLA_TOOLS_URL"
++    else
++      print_error "Need wget or curl to download tla2tools.jar"
++      exit 1
++    fi
++    print_success "Downloaded tla2tools.jar"
+   else
+-    print_error "Need wget or curl to download tla2tools.jar"
+-    exit 1
++    print_success "tla2tools.jar already exists"
+   fi
+-  print_success "Downloaded tla2tools.jar"
+-else
+-  print_success "tla2tools.jar already exists"
+-fi
+ 
+-if [[ ! -f "$PROJECT_ROOT/lib/CommunityModules-deps.jar" ]]; then
+-  COMMUNITY_MODULES_URL="https://github.com/tlaplus/CommunityModules/releases/download/202505152026/CommunityModules-deps.jar"
+-  print_status "Downloading CommunityModules-deps.jar..."
+-  if command_exists wget; then
+-    wget -O "$PROJECT_ROOT/lib/CommunityModules-deps.jar" "$COMMUNITY_MODULES_URL"
+-  elif command_exists curl; then
+-    curl -L -o "$PROJECT_ROOT/lib/CommunityModules-deps.jar" "$COMMUNITY_MODULES_URL"
++  if [[ ! -f "$PROJECT_ROOT/lib/CommunityModules-deps.jar" ]]; then
++    COMMUNITY_MODULES_URL="https://github.com/tlaplus/CommunityModules/releases/download/202505152026/CommunityModules-deps.jar"
++    print_status "Downloading CommunityModules-deps.jar..."
++    if command_exists wget; then
++      wget -O "$PROJECT_ROOT/lib/CommunityModules-deps.jar" "$COMMUNITY_MODULES_URL"
++    elif command_exists curl; then
++      curl -L -o "$PROJECT_ROOT/lib/CommunityModules-deps.jar" "$COMMUNITY_MODULES_URL"
++    else
++      print_error "Need wget or curl to download CommunityModules-deps.jar"
++      exit 1
++    fi
++    print_success "Downloaded CommunityModules-deps.jar"
+   else
+-    print_error "Need wget or curl to download CommunityModules-deps.jar"
+-    exit 1
++    print_success "CommunityModules-deps.jar already exists"
+   fi
+-  print_success "Downloaded CommunityModules-deps.jar"
+-else
+-  print_success "CommunityModules-deps.jar already exists"
+-fi
+ 
+-_tlc_out="$(java -cp "$PROJECT_ROOT/lib/tla2tools.jar" tlc2.TLC -help 2>&1 || true)"
+-if echo "$_tlc_out" | grep -q "TLA+"; then
+-  print_success "TLA+ tool invocation verified"
+-else
+-  print_warning "TLA+ verification command failed; check your Java/JAR setup"
++  _tlc_out="$(java -cp "$PROJECT_ROOT/lib/tla2tools.jar" tlc2.TLC -help 2>&1 || true)"
++  if echo "$_tlc_out" | grep -q "TLA+"; then
++    print_success "TLA+ tool invocation verified"
++  else
++    print_warning "TLA+ verification command failed; check your Java/JAR setup"
++  fi
+ fi
+ 
+ # ─── Python tool environments ────────────────────────────────────────────────
+@@ -341,7 +359,11 @@ setup_python_tool_env \
+   "$TRACE_DEBUGGER_PYTHON" \
+   "$TRACE_DEBUGGER_DIR/requirements.txt"
+ 
+-build_cfa_jar "$PROJECT_ROOT" "$TOOLS_CFA_DIR"
++if [[ "$RUST_CFA" == true ]]; then
++  print_success "Using tla-cfa from bin/; skipping the Java CFA build"
++else
++  build_cfa_jar "$PROJECT_ROOT" "$TOOLS_CFA_DIR"
++fi
+ 
+ setup_python_tool_env \
+   "spec analyzer" \
+diff --git a/scripts/tlc/run_model_check.sh b/scripts/tlc/run_model_check.sh
+index af463225..8ebe12f6 100755
+--- a/scripts/tlc/run_model_check.sh
++++ b/scripts/tlc/run_model_check.sh
+@@ -117,9 +117,9 @@ fi
+ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ RUNTIME_ROOT="$PROJECT_ROOT"
+-if [ ! -f "$RUNTIME_ROOT/lib/tla2tools.jar" ] \
++if [ ! -f "$RUNTIME_ROOT/lib/tla2tools.jar" ] && [ ! -x "$RUNTIME_ROOT/bin/statehound" ] \
+     && [ -n "${SPECULAR_ROOT:-}" ] \
+-    && [ -f "$SPECULAR_ROOT/lib/tla2tools.jar" ]; then
++    && { [ -f "$SPECULAR_ROOT/lib/tla2tools.jar" ] || [ -x "$SPECULAR_ROOT/bin/statehound" ]; }; then
+     RUNTIME_ROOT="$(cd "$SPECULAR_ROOT" && pwd)" || {
+         echo "Error: cannot resolve SPECULAR_ROOT: $SPECULAR_ROOT"
+         exit 1
+@@ -128,8 +128,9 @@ fi
+ JAR_PATH="$RUNTIME_ROOT/lib/tla2tools.jar"
+ COMMUNITY_MODULES="$RUNTIME_ROOT/lib/CommunityModules-deps.jar"
+ 
+-if [ ! -f "$JAR_PATH" ]; then
+-    echo "Error: tla2tools.jar not found at $JAR_PATH"
++# Java TLC is needed only when Statehound (pure Rust) is not installed or is turned off.
++if [ ! -f "$JAR_PATH" ] && { [ "${STATEHOUND:-on}" = off ] || { [ ! -x "$RUNTIME_ROOT/bin/statehound" ] && ! command -v statehound >/dev/null 2>&1; }; }; then
++    echo "Error: tla2tools.jar not found at $JAR_PATH (install Statehound for a Java-free checker)"
+     exit 1
+ fi
+ 
+@@ -218,9 +219,12 @@ fi
+ echo "Log File:        $LOG_FILE"
+ echo -e "${GREEN}================================${NC}"
+ 
+-# Build TLC command with advanced JVM options
+-TLC_CMD=(
+-    java
++# Classpath for Java TLC
++CP="$JAR_PATH"
++if [ -f "$COMMUNITY_MODULES" ]; then
++    CP="$COMMUNITY_MODULES:$CP"
++fi
++TLC_JVM_OPTS=(
+     -XX:+UseParallelGC
+     -Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.OffHeapDiskFPSet
+     "-XX:MaxDirectMemorySize=${OFFHEAP_MEMORY}"
+@@ -228,17 +232,41 @@ TLC_CMD=(
+     "-Xms${MEMORY}"
+ )
+ 
+-# Add cdot support if enabled
+-if [ "$CDOT_MODE" = true ]; then
+-    TLC_CMD+=(-Dtlc2.tool.impl.Tool.cdot=true)
++# Checker selection. When Statehound is installed it replaces Java TLC: the everystate engine (pure
++# Rust) with guided state-space hunters and a result cache. STATEHOUND=off runs Java TLC directly.
++STATEHOUND_BIN="${STATEHOUND_BIN:-}"
++if [ -z "$STATEHOUND_BIN" ]; then
++    if [ -x "$RUNTIME_ROOT/bin/statehound" ]; then
++        STATEHOUND_BIN="$RUNTIME_ROOT/bin/statehound"
++    else
++        STATEHOUND_BIN="$(command -v statehound 2>/dev/null || true)"
++    fi
++fi
++if [ -z "${STATEHOUND_EVERYSTATE:-}" ] && [ -x "$RUNTIME_ROOT/bin/everystate" ]; then
++    export STATEHOUND_EVERYSTATE="$RUNTIME_ROOT/bin/everystate"
++fi
++CHECKER=statehound
++if [ "${STATEHOUND:-on}" = off ]; then
++    CHECKER=tlc
++elif [ -z "$STATEHOUND_BIN" ]; then
++    echo "Note: statehound is not installed; using Java TLC."
++    CHECKER=tlc
+ fi
+ 
+-# Add classpath
+-CP="$JAR_PATH"
+-if [ -f "$COMMUNITY_MODULES" ]; then
+-    CP="$COMMUNITY_MODULES:$CP"
++if [ "$CHECKER" = statehound ]; then
++    TLC_CMD=("$STATEHOUND_BIN")
++    if [ "$CDOT_MODE" = true ]; then
++        TLC_CMD+=(--cdot)
++    fi
++    echo "Checker:         statehound (everystate engine + guided hunters, no JVM)"
++else
++    TLC_CMD=(java "${TLC_JVM_OPTS[@]}")
++    # Add cdot support if enabled
++    if [ "$CDOT_MODE" = true ]; then
++        TLC_CMD+=(-Dtlc2.tool.impl.Tool.cdot=true)
++    fi
++    TLC_CMD+=(-cp "$CP" tlc2.TLC)
+ fi
+-TLC_CMD+=(-cp "$CP" tlc2.TLC)
+ 
+ # Add config file
+ TLC_CMD+=(-config "$CONFIG_FILE")
+diff --git a/scripts/tlc/validate.sh b/scripts/tlc/validate.sh
+index 820e30f5..4b3ab5c5 100755
+--- a/scripts/tlc/validate.sh
++++ b/scripts/tlc/validate.sh
+@@ -6,6 +6,15 @@ TOOLDIR="${TOOLDIR:-$(cd "$SCRIPT_DIR/../.." && pwd)/lib}"
+ STATEDIR="$(mktemp -d)"
+ trap 'rm -rf "$STATEDIR"' EXIT
+ 
++# Prefer everystate (the pure-Rust checker installed by Statehound); Java TLC only when it is missing.
++EVERYSTATE="${STATEHOUND_EVERYSTATE:-}"
++if [ -z "$EVERYSTATE" ] && [ -x "$SCRIPT_DIR/../../bin/everystate" ]; then
++    EVERYSTATE="$(cd "$SCRIPT_DIR/../.." && pwd)/bin/everystate"
++fi
++if [ -z "$EVERYSTATE" ]; then
++    EVERYSTATE="$(command -v everystate 2>/dev/null || true)"
++fi
++
+ LOG_TO_FILE=false
+ PARALLEL=$(nproc)
+ 
+@@ -50,6 +59,12 @@ function validate {
+     local spec=${3}
+     local config=${4}
+     local tooldir=${5}
++    local CHECKER
++    if [ -n "$EVERYSTATE" ]; then
++        CHECKER=("$EVERYSTATE")
++    else
++        CHECKER=(java -XX:+UseParallelGC -cp "${tooldir}/tla2tools.jar:${tooldir}/CommunityModules-deps.jar" tlc2.TLC)
++    fi
+     local statedir=${6}
+     local log_to_file=${7}
+     local log=""
+@@ -62,10 +77,10 @@ function validate {
+ 
+     set -o pipefail
+     if [ "${log_to_file}" = "true" ]; then
+-        env JSON="${trace}" java -XX:+UseParallelGC -cp ${tooldir}/tla2tools.jar:${tooldir}/CommunityModules-deps.jar tlc2.TLC -config "${config}" "${spec}" -lncheck final -metadir "${statedir}" -fpmem 0.9 2>&1 | tee "${log}" | sed -nuE "s/<<\"Progress %:\", ([0-9]{1,2})>>$/${id} \1/p"
++        env JSON="${trace}" "${CHECKER[@]}" -config "${config}" "${spec}" -lncheck final -metadir "${statedir}" -fpmem 0.9 2>&1 | tee "${log}" | sed -nuE "s/<<\"Progress %:\", ([0-9]{1,2})>>$/${id} \1/p"
+         local tlc_status=${PIPESTATUS[0]}
+     else
+-        env JSON="${trace}" java -XX:+UseParallelGC -cp ${tooldir}/tla2tools.jar:${tooldir}/CommunityModules-deps.jar tlc2.TLC -config "${config}" "${spec}" -lncheck final -metadir "${statedir}" -fpmem 0.9 2>&1 | sed -nuE "s/<<\"Progress %:\", ([0-9]{1,2})>>$/${id} \1/p"
++        env JSON="${trace}" "${CHECKER[@]}" -config "${config}" "${spec}" -lncheck final -metadir "${statedir}" -fpmem 0.9 2>&1 | sed -nuE "s/<<\"Progress %:\", ([0-9]{1,2})>>$/${id} \1/p"
+         local tlc_status=${PIPESTATUS[0]}
+     fi
+ 
+@@ -140,7 +155,9 @@ fi
+ echo "spec: ${SPEC}"
+ echo "config: ${CONFIG}"
+ 
+-install_tlaplus
++if [ -z "$EVERYSTATE" ]; then
++    install_tlaplus
++fi
+ 
+ total=${#trace_files[@]}
+ SECONDS=0
+diff --git a/skills/specular-lite/assets/shared.zip b/skills/specular-lite/assets/shared.zip
+index d209ad866af587155543df0357151965a6a62426..a4c31db3430224eb986fc97982d74293a8cb8227 100644
+GIT binary patch
+delta 5270
+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
+bfAkx)M!Gn-*Y~D?`S;O)Kt_U?_9N&&C+sFk
+
+delta 4694
+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
+
+diff --git a/src/specular/native_compaction.py b/src/specular/native_compaction.py
+index f12a6e97..fc793517 100644
+--- a/src/specular/native_compaction.py
++++ b/src/specular/native_compaction.py
+@@ -5,7 +5,6 @@ from __future__ import annotations
+ import asyncio
+ import base64
+ import contextlib
+-import importlib
+ import json
+ import os
+ import secrets
+@@ -187,7 +186,7 @@ async def pi(state: dict[str, Any], log: Path) -> dict[str, Any]:
+ 
+ async def copilot(state: dict[str, Any], log: Path) -> dict[str, Any]:
+     # Installed by tools/context_control/requirements.txt, not needed by other paths.
+-    sdk = importlib.import_module("copilot")
++    import copilot as sdk
+     client: Any = sdk.CopilotClient(
+         connection=sdk.RuntimeConnection.for_stdio(path=shutil.which("copilot") or "copilot"),
+         working_directory=state["cwd"],
+diff --git a/tests/unit/test_context_control.py b/tests/unit/test_context_control.py
+index da936162..41f057a9 100644
+--- a/tests/unit/test_context_control.py
++++ b/tests/unit/test_context_control.py
+@@ -411,7 +411,7 @@ async def test_copilot_obeys_native_success_not_just_rpc_return(
+     sdk = SimpleNamespace(
+         CopilotClient=lambda **kwargs: client, RuntimeConnection=SimpleNamespace(for_stdio=lambda **kwargs: None)
+     )
+-    monkeypatch.setattr(importlib, "import_module", lambda name: sdk)
++    monkeypatch.setitem(sys.modules, "copilot", sdk)
+     result = await native.copilot({"session_id": "original", "cwd": str(tmp_path)}, tmp_path / "log")
+     assert result["status"] == ("completed" if success else "failed")
+     client.resume_session.assert_awaited_once_with(
+diff --git a/tools/inv_checking_tool/src/handler_plugin.py b/tools/inv_checking_tool/src/handler_plugin.py
+new file mode 100644
+index 00000000..021cf584
+--- /dev/null
++++ b/tools/inv_checking_tool/src/handler_plugin.py
+@@ -0,0 +1,23 @@
++"""Loading of the optional user handler module (HANDLER_PY) for TraceReader.
++
++This is the only part of the trace reader that imports code chosen at run time. It is kept in its own
++module so that the rest of the reader has no dynamic imports and can be ported unit by unit.
++"""
++
++import os
++import sys
++from types import ModuleType
++
++
++def load_handler_module(handler_py: str) -> ModuleType | None:
++    """Import the handler file at ``handler_py`` the way TraceReader always has: by module name, with its
++    directory first on ``sys.path`` while importing. Returns ``None`` (with a warning) when it cannot be found."""
++    try:
++        sys.path.insert(0, os.path.dirname(handler_py))
++        try:
++            return __import__(os.path.basename(handler_py).replace(".py", ""))
++        finally:
++            sys.path.pop(0)
++    except ModuleNotFoundError:
++        print(f"Warning: cannot import module '{handler_py}'", file=sys.stderr)
++        return None
+diff --git a/tools/inv_checking_tool/src/trace_reader.py b/tools/inv_checking_tool/src/trace_reader.py
+index dc4e9f49..1e361ef7 100644
+--- a/tools/inv_checking_tool/src/trace_reader.py
++++ b/tools/inv_checking_tool/src/trace_reader.py
+@@ -2,11 +2,17 @@
+ 
+ # usage: python3 trace_reader.py -h
+ 
++import ast
+ import os
+ import re
+ import sys
+ from collections import OrderedDict, defaultdict
+ 
++try:  # imported as part of the package
++    from .handler_plugin import load_handler_module
++except ImportError:  # run as a script
++    from handler_plugin import load_handler_module
++
+ 
+ class TraceReader:
+     LIST_IS_SEQ = "seq"
+@@ -38,13 +44,7 @@ class TraceReader:
+             handler_py = os.getenv("HANDLER_PY")
+             if handler_py is None:
+                 return
+-        try:
+-            sys.path.insert(0, os.path.dirname(handler_py))
+-            handler_module = __import__(os.path.basename(handler_py).replace(".py", ""))
+-            sys.path.pop(0)
+-        except ModuleNotFoundError:
+-            print(f"Warning: cannot import module '{handler_py}'", file=sys.stderr)
+-            handler_module = None
++        handler_module = load_handler_module(handler_py)
+ 
+         if hasattr(handler_module, "user_dict"):
+             self.set_user_dict(handler_module.user_dict)
+@@ -228,7 +228,8 @@ class TraceReader:
+         state_hash = line[:space_idx]
+         label_end_idx = 1 if line[-2] == ";" else 0
+         label_end_idx += 2 if line[-label_end_idx - 3] == '"' else 17
+-        label = eval(line[space_idx + 8 : -label_end_idx]) + "\n"
++        # the label is a quoted string literal in the DOT dump; parse it, never execute it
++        label = ast.literal_eval(line[space_idx + 8 : -label_end_idx]) + "\n"
+         return int(state_hash), label
+ 
+     @staticmethod
+diff --git a/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py b/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py
+index 916cc7b9..39c565ae 100644
+--- a/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py
++++ b/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py
+@@ -14,6 +14,22 @@ from ..utils.logger import logger
+ from .base import BaseHandler
+ 
+ 
++def _everystate_binary(root: str | None = None) -> str | None:
++    """The everystate binary (the pure-Rust TLC replacement installed by Statehound), or None.
++
++    Looked up in STATEHOUND_EVERYSTATE, then <root>/bin/everystate, then PATH."""
++    import shutil
++
++    for candidate in (
++        os.environ.get("STATEHOUND_EVERYSTATE"),
++        os.path.join(root, "bin", "everystate") if root else None,
++        shutil.which("everystate"),
++    ):
++        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
++            return candidate
++    return None
++
++
+ class TraceValidationHandler(BaseHandler):
+     """Handler for run_trace_validation tool.
+ 
+@@ -99,9 +115,12 @@ class TraceValidationHandler(BaseHandler):
+         return tla_jar, community_jar
+ 
+     def _build_command(self, args: dict[str, Any], tla_jar: str, community_jar: str) -> list:
+-        """Build TLC command."""
+-        classpath = f"{tla_jar}:{community_jar}"
++        """Build the model-checker command: everystate when installed, else Java TLC."""
+         metadir = args.get("metadir", "/tmp/tlc_validation")
++        everystate = _everystate_binary(os.environ.get("SPECULAR_ROOT") or os.path.dirname(os.path.dirname(tla_jar)))
++        if everystate:
++            return [everystate, "-config", args["config_file"], args["spec_file"], "-lncheck", "final", "-metadir", metadir]
++        classpath = f"{tla_jar}:{community_jar}"
+         return [
+             "java",
+             "-XX:+UseParallelGC",

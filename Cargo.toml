@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/statehound"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/allthingssecurity/statehound"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

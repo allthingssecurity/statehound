@@ -1,0 +1,996 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index c605304..eec3217 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -131,7 +131,7 @@ impl Reporter {
+             self.host.print(&format!("{}{}\n", prefix, text));
+         }
+     }
+-    fn plain(&self, text: &str) {
++    pub(crate) fn plain(&self, text: &str) {
+         self.host.print(&format!("{}\n", text));
+     }
+     pub(crate) fn now(&self) -> String {
+@@ -332,7 +332,7 @@ impl Events for CliEvents<'_> {
+     }
+ }
+ 
+-const USAGE: &str = concat!("everystate ", env!("CARGO_PKG_VERSION"), " - a TLA+ model checker (TLC-compatible command line)\n\nUsage: everystate [options] SPEC[.tla]\n\n  -config FILE        configuration file (default: SPEC.cfg)\n  -deadlock           do not check for deadlock\n  -simulate [num=N][,file=PREFIX]   random simulation: generate N behaviors instead of all states\n                      (without num=N it runs until an error is found; with -json the default is 1000)\n  -depth N            simulation: maximal length of a behavior (default 100)\n  -seed N, -aril N    simulation: seed of the random choices (the same seed repeats the run)\n  -tool               machine-readable output (TLC's -tool message framing)\n  -dump [dot[,actionlabels]] FILE   write the reachable state graph\n  -json               print a single JSON result object instead of TLC-style output\n  -workers N|auto     search with N threads (auto: one per core); the result is the same as with 1\n  -fp N, -lncheck S, -metadir DIR, ...   accepted for compatibility\n\n       everystate conform [options] -trace TRACE SPEC[.tla]\n\n  checks that a recorded run of the real system (JSON Lines) is a behaviour of the spec;\n  exit status 0 conforms, 20 does not conform (see: everystate conform -help)\n\nExit status: 0 success, 10 assumption, 11 deadlock, 12 safety, 13 liveness, 150 parse error, 151 config error.\n");
++const USAGE: &str = concat!("everystate ", env!("CARGO_PKG_VERSION"), " - a TLA+ model checker (TLC-compatible command line)\n\nUsage: everystate [options] SPEC[.tla]\n\n  -config FILE        configuration file (default: SPEC.cfg)\n  -deadlock           do not check for deadlock\n  -simulate [num=N][,file=PREFIX]   random simulation: generate N behaviors instead of all states\n                      (without num=N it runs until an error is found; with -json the default is 1000)\n  -depth N            simulation: maximal length of a behavior (default 100)\n  -seed N, -aril N    simulation: seed of the random choices (the same seed repeats the run)\n  -hunt [budget=S][,max=N][,rollout=N][,strategy=guided|uniform]   guided bug hunting: UCB restarts,\n                      Thompson-sampled actions, Boltzmann successor choice, Good-Turing stop (not exhaustive)\n  -tool               machine-readable output (TLC's -tool message framing)\n  -dump [dot[,actionlabels]] FILE   write the reachable state graph\n  -json               print a single JSON result object instead of TLC-style output\n  -workers N|auto     search with N threads (auto: one per core); the result is the same as with 1\n  -fp N, -lncheck S, -metadir DIR, ...   accepted for compatibility\n\n       everystate conform [options] -trace TRACE SPEC[.tla]\n\n  checks that a recorded run of the real system (JSON Lines) is a behaviour of the spec;\n  exit status 0 conforms, 20 does not conform (see: everystate conform -help)\n\nExit status: 0 success, 10 assumption, 11 deadlock, 12 safety, 13 liveness, 150 parse error, 151 config error.\n");
+ 
+ /// The number of cores, which is what `-workers auto` means.
+ fn cores() -> usize {
+@@ -445,7 +445,7 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+                 }
+             }
+             "-dumpTrace" | "-loadTrace" => i += 2,
+-            "-simulate" | "-generate" | "-depth" | "-seed" | "-aril" => {
++            "-simulate" | "-hunt" | "-generate" | "-depth" | "-seed" | "-aril" => {
+                 if let Err(e) = sim.parse(argv, &mut i) {
+                     host.print(&format!("{}\n", e));
+                     return 1;
+diff --git a/src/main.rs b/src/main.rs
+index afb6d66..9299d9d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -20,6 +20,17 @@ fn main() {
+         let _ = std::io::stdout().write_all(everystate::pprint::ppr_width(&input, width).as_bytes());
+         return;
+     }
++    // Started by a supervisor (statehound) that may be killed outright: exit as soon as the parent
++    // is gone, instead of running on as an orphan.
++    if std::env::var("EVERYSTATE_EXIT_WITH_PARENT").map(|v| v == "1").unwrap_or(false) {
++        let parent = std::os::unix::process::parent_id();
++        std::thread::spawn(move || loop {
++            std::thread::sleep(std::time::Duration::from_millis(250));
++            if std::os::unix::process::parent_id() != parent {
++                std::process::exit(143);
++            }
++        });
++    }
+     // Evaluating deeply recursive TLA+ definitions needs far more stack than the main thread has.
+     const STACK: usize = 1 << 30;
+     let child = std::thread::Builder::new()
+diff --git a/src/simulate.rs b/src/simulate.rs
+index c33a9f4..558c239 100644
+--- a/src/simulate.rs
++++ b/src/simulate.rs
+@@ -29,6 +29,9 @@ use crate::value::*;
+ use std::cell::RefCell;
+ use std::collections::HashMap;
+ 
++pub mod hunt;
++pub use hunt::{HuntOptions, HuntStats, Strategy};
++
+ /// The number of behaviours generated when no bound is given and the caller cannot be interrupted
+ /// (`-json`, the WebAssembly API). The plain command line runs until an error is found, as TLC does.
+ pub const DEFAULT_TRACES: u64 = 1000;
+@@ -46,6 +49,8 @@ pub struct SimOptions {
+     pub check_deadlock: bool,
+     /// `file=PREFIX`: every behaviour is written to `PREFIX_0_<n>` as a TLA+ module.
+     pub trace_file: Option<String>,
++    /// `-hunt`: guided bug hunting instead of uniform random behaviours (see `hunt`).
++    pub hunt: Option<HuntOptions>,
+ }
+ 
+ /// splitmix64: small, seedable and identical on every target.
+@@ -119,6 +124,8 @@ pub struct SimOutcome {
+     pub summary: bool,
+     /// ... and the closing progress line.
+     pub final_progress: bool,
++    /// What a `-hunt` run found out (`None` for `-simulate`).
++    pub hunt: Option<HuntStats>,
+ }
+ 
+ /// The label TLC's simulator prints for the first state of a trace: the initial predicate by name
+@@ -184,7 +191,7 @@ impl<'a, 'o> Sim<'a, 'o> {
+         // the behaviour that ends in the error counts towards the longest one
+         stats.longest = stats.longest.max(result.trace.as_ref().map_or(0, |t| t.len().min(u32::MAX as usize) as u32));
+         result.depth = stats.longest;
+-        SimOutcome { result, stats, summary, final_progress }
++        SimOutcome { result, stats, summary, final_progress, hunt: None }
+     }
+ 
+     /// The behaviour as TLC reports it: finite stuttering (a step that changes nothing) is left out.
+@@ -240,11 +247,7 @@ impl<'a, 'o> Sim<'a, 'o> {
+     /// One step from the last state of `trace`: the chosen successor and its action, `None` when no
+     /// action has an admissible successor and deadlock is not an error, or the error to report.
+     fn step(&mut self, trace: &[TraceStep], succs: &mut Vec<StateRef>, keep: &mut Vec<StateRef>) -> Result<Option<(StateRef, usize)>, SimOutcome> {
+-        let m = self.model;
+-        let ev = self.ev;
+-        let s = trace[trace.len() - 1].state.clone();
+-        let lvl = trace.len() as i64;
+-        let n = m.actions.len();
++        let n = self.model.actions.len();
+         let mut index = self.rng.below(n);
+         // a prime that does not divide the number of actions visits every action
+         let mut pi = self.rng.below(PRIMES.len());
+@@ -258,6 +261,32 @@ impl<'a, 'o> Sim<'a, 'o> {
+         }
+         let mut has_successor = false;
+         for _ in 0..n {
++            has_successor |= self.check_action(trace, index, succs, keep)?;
++            if !keep.is_empty() {
++                let t = keep[self.rng.below(keep.len())].clone();
++                return Ok(Some((t, index)));
++            }
++            index = (index + stride) % n;
++        }
++        if self.opts.check_deadlock && !has_successor {
++            let mut r = self.result("deadlock");
++            r.trace = Some(self.compress(trace, None));
++            return Err(self.outcome(r, true, true));
++        }
++        Ok(None)
++    }
++
++    /// The successors of the last state of `trace` by action `index`, each checked against the
++    /// invariants and action properties (an error is returned as the outcome to report); the ones
++    /// inside the state and action constraints are left in `keep`. Returns whether the action had any
++    /// successor at all (for deadlock detection). Shared by `-simulate` and `-hunt`.
++    pub(crate) fn check_action(&mut self, trace: &[TraceStep], index: usize, succs: &mut Vec<StateRef>, keep: &mut Vec<StateRef>) -> Result<bool, SimOutcome> {
++        let m = self.model;
++        let ev = self.ev;
++        let s = trace[trace.len() - 1].state.clone();
++        let lvl = trace.len() as i64;
++        let mut has_successor = false;
++        {
+             succs.clear();
+             keep.clear();
+             ev.stats.level.set(lvl);
+@@ -337,18 +366,8 @@ impl<'a, 'o> Sim<'a, 'o> {
+                     Ok(false) => {}
+                 }
+             }
+-            if !keep.is_empty() {
+-                let t = keep[self.rng.below(keep.len())].clone();
+-                return Ok(Some((t, index)));
+-            }
+-            index = (index + stride) % n;
+         }
+-        if self.opts.check_deadlock && !has_successor {
+-            let mut r = self.result("deadlock");
+-            r.trace = Some(self.compress(trace, None));
+-            return Err(self.outcome(r, true, true));
+-        }
+-        Ok(None)
++        Ok(has_successor)
+     }
+ 
+     /// Checks the temporal properties on one behaviour: on the graph of its states, with the steps it
+@@ -571,6 +590,12 @@ fn run(sim: &mut Sim, events: &mut dyn SimEvents) -> SimOutcome {
+         return sim.outcome(r, false, false);
+     }
+ 
++    if let Some(ho) = &opts.hunt {
++        let (mut out, st) = hunt::run_hunt(sim, start, ho, events);
++        out.hunt = Some(st);
++        return out;
++    }
++
+     // ---- behaviours ----
+     let first = init_label(model);
+     let mut last_progress = ev.host.borrow().now_ms();
+@@ -630,6 +655,7 @@ fn run(sim: &mut Sim, events: &mut dyn SimEvents) -> SimOutcome {
+ #[derive(Default)]
+ pub struct SimArgs {
+     on: bool,
++    hunt: Option<HuntOptions>,
+     num: Option<u64>,
+     file: Option<String>,
+     depth: Option<i64>,
+@@ -641,6 +667,17 @@ impl SimArgs {
+     /// `*i` on the last argument it consumed. Errors are worded as TLC words them.
+     pub fn parse(&mut self, argv: &[String], i: &mut usize) -> Result<(), String> {
+         let flag = argv[*i].as_str();
++        if flag == "-hunt" {
++            let mut spec = "";
++            if let Some(a) = argv.get(*i + 1) {
++                if a.contains('=') && !a.starts_with('-') {
++                    *i += 1;
++                    spec = a.as_str();
++                }
++            }
++            self.hunt = Some(HuntOptions::parse(spec)?);
++            return Ok(());
++        }
+         if flag == "-generate" {
+             return Err("Error: -generate (TLC's probabilistic generation mode) is not supported by everystate; use -simulate.".into());
+         }
+@@ -683,12 +720,13 @@ impl SimArgs {
+     /// The options of the run, or `None` without `-simulate`. A run without `num=` goes on until it
+     /// finds an error, as in TLC, except with `-json`, whose single result needs the run to end.
+     pub fn options(&self, json: bool, now_ms: f64) -> Option<SimOptions> {
+-        if !self.on {
++        if !self.on && self.hunt.is_none() {
+             return None;
+         }
+         Some(SimOptions {
+             num: self.num.or(if json { Some(DEFAULT_TRACES) } else { None }),
+             depth: match self.depth {
++                None if self.hunt.is_some() => None,
+                 None => Some(DEFAULT_DEPTH),
+                 Some(-1) => None,
+                 Some(d) => Some(d.max(0) as u32),
+@@ -697,6 +735,7 @@ impl SimArgs {
+             aril: self.aril.unwrap_or(0),
+             check_deadlock: true,
+             trace_file: self.file.clone(),
++            hunt: self.hunt.clone(),
+         })
+     }
+ }
+@@ -745,10 +784,17 @@ impl SimEvents for CliSim<'_> {
+ /// `-tool` progress lines); `depth` is the number of states of the longest behaviour.
+ pub fn sim_json(model: &Model, out: &SimOutcome, opts: &SimOptions, extended: bool) -> String {
+     let st = &out.stats;
+-    let counts = format!(
+-        ",\"mode\":\"simulate\",\"generated\":{},\"distinct\":-1,\"queue\":-1,\"depth\":{},\"traces\":{},\"seed\":{},\"aril\":{}",
++    let mut counts = format!(
++        ",\"mode\":\"{}\",\"generated\":{},\"distinct\":-1,\"queue\":-1,\"depth\":{},\"traces\":{},\"seed\":{},\"aril\":{}",
++        if out.hunt.is_some() { "hunt" } else { "simulate" },
+         st.generated, st.longest, st.traces, opts.seed, opts.aril
+     );
++    if let Some(h) = &out.hunt {
++        counts += &format!(
++            ",\"hunt\":{{\"stop\":\"{}\",\"archived\":{},\"observations\":{},\"singletons\":{},\"unseen_mass\":{:e},\"max_depth\":{},\"millis\":{}}}",
++            h.stop, h.distinct, h.observations, h.singletons, h.unseen_mass(), h.max_depth, h.millis
++        );
++    }
+     result_json_with(model, &out.result, extended, &counts)
+ }
+ 
+@@ -777,6 +823,9 @@ pub(crate) fn run_cli(rep: &Reporter, model: &Model, opts: &SimOptions, deadlock
+             progress_line(rep, &out.stats);
+         }
+         rep.msg(2210, 0, &format!("The number of states generated: {}\nSimulation using seed {} and aril {}", out.stats.generated, opts.seed, opts.aril));
++        if let Some(h) = &out.hunt {
++            rep.plain(&h.note());
++        }
+     };
+     if res.status == "ok" {
+         if out.final_progress {
+diff --git a/src/simulate/hunt.rs b/src/simulate/hunt.rs
+new file mode 100644
+index 0000000..254ee98
+--- /dev/null
++++ b/src/simulate/hunt.rs
+@@ -0,0 +1,726 @@
++//! Guided bug hunting (`-hunt`): a search for invariant violations that is neither exhaustive like
++//! breadth-first model checking nor blind like `-simulate`.
++//!
++//! The search keeps an *archive* of every distinct state it has met (its fingerprint, the state, and the
++//! state and action it was first reached from), so any violation it finds comes with a complete,
++//! replayable behaviour from an initial state. Each iteration
++//!
++//! 1. **selects a start state from the archive** with an upper confidence bound (UCB1, the tree policy
++//!    of Monte Carlo tree search) evaluated on a random tournament of archived states: states whose
++//!    earlier rollouts found many new states, and states rarely started from, are preferred;
++//! 2. **rolls out** a bounded behaviour from it. At each step the actions are tried in the order of a
++//!    *Thompson sample* from per-action Beta posteriors of "this action yields a state not seen before"
++//!    (Bayesian bandit), and the next state is drawn from the admissible successors with *Boltzmann
++//!    weights* `exp(-(visits - 1) / T)` whose temperature `T` is annealed logarithmically (low-visit
++//!    states are preferred, more strongly as the search goes on);
++//! 3. **credits** the start state with the number of new states the rollout found.
++//!
++//! Every successor is checked against the invariants and action properties exactly as in `-simulate`
++//! (the same `check_action`), so a reported violation is a genuine behaviour of the specification.
++//!
++//! The search stops at the first violation, when the time budget or the archive bound is reached, or by
++//! the *Good–Turing* rule: the estimated probability that the next successor observed is a state not
++//! seen before, `N1 / N` (states observed exactly once over all observations), falls below `eps`. A run
++//! that ends without a violation proves nothing: it is reported as a simulation result, never as a
++//! completed model check.
++//!
++//! Temporal properties are not checked by the hunt (use exhaustive checking for those).
++use super::*;
++use std::time::Instant;
++
++#[derive(Clone, Debug, PartialEq)]
++pub enum Strategy {
++    /// Best-first expansion of the frontier by surprisal (rare variable values first), with
++    /// depth-first dives; every selected state is expanded by all actions.
++    Frontier,
++    /// UCB start selection, Thompson action order, Boltzmann successor choice (bounded rollouts).
++    Guided,
++    /// The same archive and restarts, but uniform random choices everywhere (an ablation baseline).
++    Uniform,
++}
++
++#[derive(Clone, Debug)]
++pub struct HuntOptions {
++    /// Wall-clock budget in milliseconds (`budget=SECONDS`); `None`: no time limit.
++    pub budget_ms: Option<u64>,
++    /// Maximal number of archived (distinct) states (`max=N`).
++    pub max_states: u64,
++    /// Steps of one rollout (`rollout=N`).
++    pub rollout: u32,
++    /// UCB exploration constant (`c=X`).
++    pub ucb_c: f64,
++    /// Tournament size for start-state selection (`pool=N`).
++    pub pool: usize,
++    /// Initial Boltzmann temperature (`temp=X`).
++    pub temp0: f64,
++    /// Good–Turing stopping threshold on the estimated probability of a new state (`eps=X`); 0 disables.
++    pub gt_eps: f64,
++    /// Observations required before the Good–Turing rule may stop the search (`minobs=N`).
++    pub gt_min_obs: u64,
++    pub strategy: Strategy,
++    /// Frontier strategy: probability of continuing from the newest state (a depth-first dive)
++    /// instead of the most surprising one (`dive=X`).
++    pub dive: f64,
++}
++
++impl Default for HuntOptions {
++    fn default() -> Self {
++        HuntOptions {
++            budget_ms: None,
++            max_states: 20_000_000,
++            rollout: 32,
++            ucb_c: 1.4,
++            pool: 32,
++            temp0: 1.0,
++            gt_eps: 1e-4,
++            gt_min_obs: 200_000,
++            strategy: Strategy::Frontier,
++            dive: 0.5,
++        }
++    }
++}
++
++impl HuntOptions {
++    /// Parses the comma-separated `key=value` list that may follow `-hunt`.
++    pub fn parse(spec: &str) -> Result<HuntOptions, String> {
++        let mut o = HuntOptions::default();
++        for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
++            let (k, v) = part.split_once('=').ok_or_else(|| format!("Error: -hunt option '{}' is not of the form key=value.", part))?;
++            let num = |v: &str| v.parse::<f64>().map_err(|_| format!("Error: -hunt option {} needs a number, got '{}'.", k, v));
++            match k {
++                "budget" => o.budget_ms = Some((num(v)? * 1000.0).max(0.0) as u64),
++                "max" => o.max_states = num(v)?.max(1.0) as u64,
++                "rollout" => o.rollout = num(v)?.max(1.0) as u32,
++                "c" => o.ucb_c = num(v)?.max(0.0),
++                "pool" => o.pool = num(v)?.max(1.0) as usize,
++                "temp" => o.temp0 = num(v)?.max(1e-9),
++                "eps" => o.gt_eps = num(v)?.max(0.0),
++                "minobs" => o.gt_min_obs = num(v)?.max(0.0) as u64,
++                "dive" => o.dive = num(v)?.clamp(0.0, 1.0),
++                "strategy" => {
++                    o.strategy = match v {
++                        "frontier" => Strategy::Frontier,
++                        "guided" => Strategy::Guided,
++                        "uniform" => Strategy::Uniform,
++                        _ => return Err(format!("Error: -hunt strategy must be frontier, guided or uniform, got '{}'.", v)),
++                    }
++                }
++                _ => return Err(format!("Error: unknown -hunt option '{}' (budget, max, rollout, c, pool, temp, eps, minobs, dive, strategy).", k)),
++            }
++        }
++        Ok(o)
++    }
++}
++
++/// What the hunt found out, for the report.
++#[derive(Clone, Debug, Default)]
++pub struct HuntStats {
++    pub distinct: u64,
++    pub observations: u64,
++    pub singletons: u64,
++    pub rollouts: u64,
++    pub max_depth: u32,
++    pub stop: &'static str,
++    pub millis: u64,
++}
++impl HuntStats {
++    /// The Good–Turing estimate of the probability that the next observed successor is a new state.
++    pub fn unseen_mass(&self) -> f64 {
++        if self.observations == 0 {
++            1.0
++        } else {
++            self.singletons as f64 / self.observations as f64
++        }
++    }
++    pub fn note(&self) -> String {
++        format!(
++            "Hunt finished ({}): {} distinct states archived, {} successor observations, {} rollouts, deepest state at depth {}, {:.1}s. \
++             Good-Turing estimate of the probability that the next successor is a new state: {:.2e}. \
++             A hunt without a violation is not a proof: it is not exhaustive.",
++            self.stop,
++            self.distinct,
++            self.observations,
++            self.rollouts,
++            self.max_depth,
++            self.millis as f64 / 1000.0,
++            self.unseen_mass()
++        )
++    }
++}
++
++const NONE: u32 = u32::MAX;
++
++struct Node {
++    state: StateRef,
++    parent: u32,
++    action: u32,
++    depth: u32,
++    /// times this state was observed as an admissible successor (or as an initial state)
++    seen: u32,
++    /// rollouts started here, and the sum of their rewards (new states found per step)
++    starts: u32,
++    reward: f64,
++}
++
++/// A sample from Gamma(shape, 1) for shape >= 1 (Marsaglia and Tsang), from the seeded generator.
++fn gamma(rng: &mut Rng, shape: f64) -> f64 {
++    let d = shape - 1.0 / 3.0;
++    let c = 1.0 / (9.0 * d).sqrt();
++    loop {
++        let (x, v) = loop {
++            let x = normal(rng);
++            let v = 1.0 + c * x;
++            if v > 0.0 {
++                break (x, v * v * v);
++            }
++        };
++        let u = unit(rng);
++        if u < 1.0 - 0.0331 * x * x * x * x || u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
++            return d * v;
++        }
++    }
++}
++fn unit(rng: &mut Rng) -> f64 {
++    // 53 random bits in (0, 1)
++    ((rng.next() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
++}
++fn normal(rng: &mut Rng) -> f64 {
++    // Box–Muller
++    let (u1, u2) = (unit(rng), unit(rng));
++    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
++}
++/// A sample from Beta(a, b), a, b >= 1.
++fn beta(rng: &mut Rng, a: f64, b: f64) -> f64 {
++    let x = gamma(rng, a);
++    let y = gamma(rng, b);
++    x / (x + y)
++}
++
++struct Hunt<'h> {
++    o: &'h HuntOptions,
++    archive: Vec<Node>,
++    index: HashMap<u64, u32>,
++    /// Beta posterior per action of "yields a new state": (successes + 1, failures + 1)
++    alpha: Vec<f64>,
++    beta: Vec<f64>,
++    observations: u64,
++    singletons: u64,
++    total_starts: u64,
++    max_depth: u32,
++}
++
++impl Hunt<'_> {
++    /// Records an observation of `s`; returns its archive id and whether it is new.
++    fn observe(&mut self, sim: &Sim, s: &StateRef, parent: u32, action: u32) -> R<(u32, bool)> {
++        let fp = sim.ck.fingerprint(s)?;
++        self.observations += 1;
++        if let Some(&id) = self.index.get(&fp) {
++            let n = &mut self.archive[id as usize];
++            n.seen = n.seen.saturating_add(1);
++            if n.seen == 2 {
++                self.singletons -= 1;
++            }
++            return Ok((id, false));
++        }
++        let depth = if parent == NONE { 1 } else { self.archive[parent as usize].depth + 1 };
++        self.max_depth = self.max_depth.max(depth);
++        let id = self.archive.len() as u32;
++        self.archive.push(Node { state: s.clone(), parent, action, depth, seen: 1, starts: 0, reward: 0.0 });
++        self.index.insert(fp, id);
++        self.singletons += 1;
++        Ok((id, true))
++    }
++
++    /// The behaviour from an initial state to archived state `id`.
++    fn path(&self, id: u32) -> Vec<TraceStep> {
++        let mut ids = vec![];
++        let mut cur = id;
++        while cur != NONE {
++            ids.push(cur);
++            cur = self.archive[cur as usize].parent;
++        }
++        ids.reverse();
++        ids.iter()
++            .enumerate()
++            .map(|(i, &k)| {
++                let n = &self.archive[k as usize];
++                TraceStep { state: n.state.clone(), action: if i == 0 { None } else { Some(n.action as usize) }, id: i as i64 }
++            })
++            .collect()
++    }
++
++    fn select_start(&mut self, rng: &mut Rng, depth_cap: Option<u32>) -> u32 {
++        let len = self.archive.len();
++        let ok = |n: &Node| depth_cap.map_or(true, |d| n.depth < d);
++        if self.o.strategy == Strategy::Uniform || self.total_starts < 16 || rng.below(10) == 0 {
++            for _ in 0..64 {
++                let id = rng.below(len) as u32;
++                if ok(&self.archive[id as usize]) {
++                    return id;
++                }
++            }
++            return 0;
++        }
++        let ln_t = ((self.total_starts + 1) as f64).ln();
++        let mut best = (f64::NEG_INFINITY, 0u32);
++        for _ in 0..self.o.pool {
++            let id = rng.below(len) as u32;
++            let n = &self.archive[id as usize];
++            if !ok(n) {
++                continue;
++            }
++            let mean = if n.starts == 0 { 1.0 } else { n.reward / n.starts as f64 };
++            let score = mean + self.o.ucb_c * (ln_t / (n.starts as f64 + 1.0)).sqrt();
++            if score > best.0 {
++                best = (score, id);
++            }
++        }
++        best.1
++    }
++
++    /// The order in which to try the actions at one step.
++    fn action_order(&self, rng: &mut Rng, n: usize, order: &mut Vec<(f64, usize)>) {
++        order.clear();
++        for a in 0..n {
++            let key = match self.o.strategy {
++                Strategy::Guided | Strategy::Frontier => beta(rng, self.alpha[a], self.beta[a]),
++                Strategy::Uniform => unit(rng),
++            };
++            order.push((key, a));
++        }
++        order.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
++    }
++
++    /// Picks the index of the next state among `ids` (archive ids of the admissible successors).
++    fn pick_next(&self, rng: &mut Rng, ids: &[u32], temp: f64) -> usize {
++        if self.o.strategy == Strategy::Uniform || ids.len() == 1 {
++            return rng.below(ids.len());
++        }
++        let w: Vec<f64> = ids.iter().map(|&k| (-((self.archive[k as usize].seen as f64) - 1.0) / temp).exp()).collect();
++        let total: f64 = w.iter().sum();
++        if !(total > 0.0) {
++            return rng.below(ids.len());
++        }
++        let mut x = unit(rng) * total;
++        for (i, wi) in w.iter().enumerate() {
++            x -= wi;
++            if x <= 0.0 {
++                return i;
++            }
++        }
++        ids.len() - 1
++    }
++
++    fn stats(&self, rollouts: u64, stop: &'static str, t0: Instant) -> HuntStats {
++        HuntStats {
++            distinct: self.archive.len() as u64,
++            observations: self.observations,
++            singletons: self.singletons,
++            rollouts,
++            max_depth: self.max_depth,
++            stop,
++            millis: t0.elapsed().as_millis() as u64,
++        }
++    }
++}
++
++/// The hunt proper, from the admissible initial states `start` (already checked by the caller).
++pub(super) fn run_hunt(sim: &mut Sim, start: Vec<StateRef>, o: &HuntOptions, events: &mut dyn SimEvents) -> (SimOutcome, HuntStats) {
++    if o.strategy == Strategy::Frontier {
++        return run_frontier(sim, start, o, events);
++    }
++    let t0 = Instant::now();
++    let ev = sim.ev;
++    let n_actions = sim.model.actions.len();
++    let mut h = Hunt {
++        o,
++        archive: Vec::new(),
++        index: HashMap::new(),
++        alpha: vec![1.0; n_actions],
++        beta: vec![1.0; n_actions],
++        observations: 0,
++        singletons: 0,
++        total_starts: 0,
++        max_depth: 0,
++    };
++    let fail = |sim: &Sim, e: Box<Fail>| sim.outcome(sim.error(sim.ck.describe_err(&e, true), None), false, true);
++    for s in &start {
++        if let Err(e) = h.observe(sim, s, NONE, 0) {
++            let out = fail(sim, e);
++            return (out, h.stats(0, "error", t0));
++        }
++    }
++    let depth_cap = sim.opts.depth;
++    let (mut succs, mut keep): (Vec<StateRef>, Vec<StateRef>) = (vec![], vec![]);
++    let mut order: Vec<(f64, usize)> = Vec::with_capacity(n_actions);
++    let mut ids: Vec<u32> = vec![];
++    let mut rng = Rng::new(sim.opts.seed ^ 0x5eed_4a17, sim.opts.aril);
++    let mut rollouts: u64 = 0;
++    let mut last_progress = Instant::now();
++    loop {
++        // ---- stopping rules ----
++        if ev.stats.stop_requested.get() {
++            break;
++        }
++        if rollouts & 63 == 0 {
++            if let Some(b) = o.budget_ms {
++                if t0.elapsed().as_millis() as u64 >= b {
++                    let st = h.stats(rollouts, "time budget", t0);
++                    return (sim.outcome(sim.result("ok"), true, true), st);
++                }
++            }
++            if o.gt_eps > 0.0 && h.observations >= o.gt_min_obs && (h.singletons as f64) < o.gt_eps * h.observations as f64 {
++                let st = h.stats(rollouts, "Good-Turing rule", t0);
++                return (sim.outcome(sim.result("ok"), true, true), st);
++            }
++            if last_progress.elapsed().as_secs() >= 60 {
++                last_progress = Instant::now();
++                events.progress(&sim.stats);
++            }
++        }
++        if h.archive.len() as u64 >= o.max_states {
++            let st = h.stats(rollouts, "archive bound", t0);
++            return (sim.outcome(sim.result("ok"), true, true), st);
++        }
++
++        // ---- one rollout ----
++        let start_id = h.select_start(&mut rng, depth_cap);
++        let mut trace = h.path(start_id);
++        let mut cur = start_id;
++        let mut found_new: u32 = 0;
++        let mut steps: u32 = 0;
++        rollouts += 1;
++        sim.stats.traces = rollouts;
++        ev.stats.traces.set(rollouts as i64);
++        let temp = o.temp0 / (std::f64::consts::E + rollouts as f64 / 1000.0).ln();
++        while steps < o.rollout && depth_cap.map_or(true, |d| (trace.len() as u32) < d) {
++            steps += 1;
++            h.action_order(&mut rng, n_actions, &mut order);
++            let mut has_successor = false;
++            let mut moved = false;
++            for k in 0..order.len() {
++                let a = order[k].1;
++                match sim.check_action(&trace, a, &mut succs, &mut keep) {
++                    Err(out) => {
++                        let st = h.stats(rollouts, "violation", t0);
++                        return (shorten(sim, out), st);
++                    }
++                    Ok(had) => has_successor |= had,
++                }
++                if keep.is_empty() {
++                    h.beta[a] += 1.0;
++                    continue;
++                }
++                ids.clear();
++                let mut new_here = 0u32;
++                for t in keep.iter() {
++                    match h.observe(sim, t, cur, a as u32) {
++                        Err(e) => {
++                            let out = fail(sim, e);
++                            return (out, h.stats(rollouts, "error", t0));
++                        }
++                        Ok((id, is_new)) => {
++                            ids.push(id);
++                            new_here += is_new as u32;
++                        }
++                    }
++                }
++                if new_here > 0 {
++                    h.alpha[a] += 1.0;
++                } else {
++                    h.beta[a] += 1.0;
++                }
++                found_new += new_here;
++                let pick = h.pick_next(&mut rng, &ids, temp);
++                cur = ids[pick];
++                trace.push(TraceStep { state: keep[pick].clone(), action: Some(a), id: trace.len() as i64 });
++                moved = true;
++                break;
++            }
++            if !moved {
++                if sim.opts.check_deadlock && !has_successor {
++                    let mut r = sim.result("deadlock");
++                    r.trace = Some(sim.compress(&trace, None));
++                    let st = h.stats(rollouts, "deadlock", t0);
++                    return (sim.outcome(r, true, true), st);
++                }
++                break;
++            }
++        }
++        sim.stats.longest = sim.stats.longest.max(trace.len().min(u32::MAX as usize) as u32);
++        let n = &mut h.archive[start_id as usize];
++        n.starts = n.starts.saturating_add(1);
++        n.reward += found_new as f64 / steps.max(1) as f64;
++        h.total_starts += 1;
++    }
++    let st = h.stats(rollouts, "interrupted", t0);
++    (sim.outcome(sim.result("ok"), true, true), st)
++}
++
++/// Shortens a counterexample: from each state, jump to the furthest later state of the trace that is
++/// one of its admissible successors (same state, compared exactly; the state and action constraints
++/// are respected). The result is still a behaviour of the specification that ends in the same state.
++/// With `keep_last_step` (an action property was violated by the last step) the last step is kept.
++fn shortcut(sim: &Sim, tr: &[TraceStep], keep_last_step: bool) -> R<Vec<TraceStep>> {
++    let n = tr.len();
++    if n < 3 {
++        return Ok(tr.to_vec());
++    }
++    let m = sim.model;
++    let nv = sim.nvars;
++    let mut fp_pos: HashMap<u64, Vec<usize>> = HashMap::new();
++    for (k, t) in tr.iter().enumerate() {
++        fp_pos.entry(sim.ck.fingerprint(&t.state)?).or_default().push(k);
++    }
++    let (mut succs, mut acts) = (vec![], vec![]);
++    let mut out = vec![TraceStep { state: tr[0].state.clone(), action: None, id: 0 }];
++    let mut i = 0;
++    while i < n - 1 {
++        let s = &tr[i].state;
++        succs.clear();
++        acts.clear();
++        sim.ck.successors(s, &mut succs, &mut acts)?;
++        let mut best: Option<(usize, usize)> = None;
++        for (t, &a) in succs.iter().zip(acts.iter()) {
++            let positions = match fp_pos.get(&sim.ck.fingerprint(t)?) {
++                Some(p) => p,
++                None => continue,
++            };
++            for &j in positions.iter().rev() {
++                if j <= i || best.map_or(false, |(bj, _)| j <= bj) {
++                    continue;
++                }
++                if keep_last_step && j == n - 1 && i != n - 2 {
++                    continue;
++                }
++                if !same_state(t, &tr[j].state, nv) {
++                    continue;
++                }
++                let mut admissible = true;
++                for c in &m.constraints {
++                    if !sim.ck.eval_pred(c, t, None)? {
++                        admissible = false;
++                        break;
++                    }
++                }
++                if admissible {
++                    for c in &m.action_constraints {
++                        if !sim.ck.eval_pred(c, s, Some(t))? {
++                            admissible = false;
++                            break;
++                        }
++                    }
++                }
++                if admissible {
++                    best = Some((j, a as usize));
++                    break;
++                }
++            }
++        }
++        let (j, a) = best.unwrap_or((i + 1, tr[i + 1].action.unwrap_or(0)));
++        out.push(TraceStep { state: tr[j].state.clone(), action: Some(a), id: out.len() as i64 });
++        i = j;
++    }
++    Ok(out)
++}
++
++/// Applies `shortcut` to the trace of a violation found by the hunt.
++fn shorten(sim: &Sim, mut out: SimOutcome) -> SimOutcome {
++    let keep_last = match out.result.status {
++        "invariant" | "deadlock" => false,
++        "action-property" => true,
++        _ => return out,
++    };
++    if let Some(tr) = &out.result.trace {
++        if let Ok(short) = shortcut(sim, tr, keep_last) {
++            out.result.trace = Some(short);
++        }
++    }
++    out
++}
++
++/// Per-(variable, value) visit counts: the surprisal features of the frontier strategy.
++struct Features {
++    counts: HashMap<(u32, u64), u32>,
++}
++impl Features {
++    fn keys(s: &StateRef, nvars: usize, out: &mut Vec<(u32, u64)>) -> R<()> {
++        out.clear();
++        s.with(|vals| {
++            for (k, v) in vals[..nvars].iter().enumerate() {
++                let mut h = Hasher::new();
++                h.value(v)?;
++                out.push((k as u32, h.finish()));
++            }
++            Ok(())
++        })
++    }
++    fn add(&mut self, keys: &[(u32, u64)]) {
++        for k in keys {
++            *self.counts.entry(*k).or_insert(0) += 1;
++        }
++    }
++    /// Count-based exploration bonus: the sum over variables of 1/sqrt(count of its value).
++    fn score(&self, keys: &[(u32, u64)]) -> f64 {
++        keys.iter().map(|k| 1.0 / (*self.counts.get(k).unwrap_or(&1) as f64).sqrt()).sum()
++    }
++}
++
++/// The frontier strategy: a randomized best-first search. Each step takes one unexpanded state, either
++/// the newest one (a dive, with probability `dive`) or the most surprising of a random tournament of
++/// `pool` frontier states, and expands it by every action, checking every successor. When the frontier
++/// runs out, every reachable state (within the constraints) has been checked.
++fn run_frontier(sim: &mut Sim, start: Vec<StateRef>, o: &HuntOptions, events: &mut dyn SimEvents) -> (SimOutcome, HuntStats) {
++    let t0 = Instant::now();
++    let ev = sim.ev;
++    let nvars = sim.nvars;
++    let n_actions = sim.model.actions.len();
++    let mut h = Hunt {
++        o,
++        archive: Vec::new(),
++        index: HashMap::new(),
++        alpha: vec![],
++        beta: vec![],
++        observations: 0,
++        singletons: 0,
++        total_starts: 0,
++        max_depth: 0,
++    };
++    let mut feats = Features { counts: HashMap::new() };
++    let mut node_keys: Vec<Vec<(u32, u64)>> = vec![];
++    let mut frontier: Vec<u32> = vec![];
++    let mut keys = vec![];
++    let fail = |sim: &Sim, e: Box<Fail>| sim.outcome(sim.error(sim.ck.describe_err(&e, true), None), false, true);
++    macro_rules! add_state {
++        ($s:expr, $parent:expr, $action:expr) => {{
++            match h.observe(sim, $s, $parent, $action) {
++                Err(e) => {
++                    let out = fail(sim, e);
++                    return (out, h.stats(0, "error", t0));
++                }
++                Ok((id, true)) => {
++                    if let Err(e) = Features::keys($s, nvars, &mut keys) {
++                        let out = fail(sim, e);
++                        return (out, h.stats(0, "error", t0));
++                    }
++                    feats.add(&keys);
++                    node_keys.push(keys.clone());
++                    frontier.push(id);
++                    Some(id)
++                }
++                Ok((_, false)) => None,
++            }
++        }};
++    }
++    for s in &start {
++        add_state!(s, NONE, 0);
++    }
++    let depth_cap = sim.opts.depth;
++    let (mut succs, mut keep): (Vec<StateRef>, Vec<StateRef>) = (vec![], vec![]);
++    let mut rng = Rng::new(sim.opts.seed ^ 0x0f0e_57a7, sim.opts.aril);
++    let mut expansions: u64 = 0;
++    let mut newest: Option<u32> = None;
++    let mut last_progress = Instant::now();
++    while !frontier.is_empty() {
++        if ev.stats.stop_requested.get() {
++            let st = h.stats(expansions, "interrupted", t0);
++            return (sim.outcome(sim.result("ok"), true, true), st);
++        }
++        if expansions & 63 == 0 {
++            if let Some(b) = o.budget_ms {
++                if t0.elapsed().as_millis() as u64 >= b {
++                    let st = h.stats(expansions, "time budget", t0);
++                    return (sim.outcome(sim.result("ok"), true, true), st);
++                }
++            }
++            if last_progress.elapsed().as_secs() >= 60 {
++                last_progress = Instant::now();
++                events.progress(&sim.stats);
++            }
++        }
++        if h.archive.len() as u64 >= o.max_states {
++            let st = h.stats(expansions, "archive bound", t0);
++            return (sim.outcome(sim.result("ok"), true, true), st);
++        }
++        // ---- select ----
++        let pos = match newest.and_then(|id| frontier.iter().rposition(|&f| f == id)) {
++            Some(p) if unit(&mut rng) < o.dive => p,
++            _ => {
++                let mut best = (f64::NEG_INFINITY, 0usize);
++                for _ in 0..o.pool.min(frontier.len()) {
++                    let p = rng.below(frontier.len());
++                    let sc = feats.score(&node_keys[frontier[p] as usize]);
++                    if sc > best.0 {
++                        best = (sc, p);
++                    }
++                }
++                best.1
++            }
++        };
++        let id = frontier.swap_remove(pos);
++        newest = None;
++        if depth_cap.map_or(false, |d| h.archive[id as usize].depth >= d) {
++            continue;
++        }
++        // ---- expand by every action ----
++        let trace = h.path(id);
++        expansions += 1;
++        sim.stats.traces = expansions;
++        sim.stats.longest = sim.stats.longest.max(trace.len().min(u32::MAX as usize) as u32);
++        let mut has_successor = false;
++        for a in 0..n_actions {
++            match sim.check_action(&trace, a, &mut succs, &mut keep) {
++                Err(out) => {
++                    let st = h.stats(expansions, "violation", t0);
++                    return (shorten(sim, out), st);
++                }
++                Ok(had) => has_successor |= had,
++            }
++            let kept = std::mem::take(&mut keep);
++            for t in kept.iter() {
++                if let Some(nid) = add_state!(t, id, a as u32) {
++                    newest = Some(nid);
++                }
++            }
++            keep = kept;
++        }
++        if sim.opts.check_deadlock && !has_successor {
++            let mut r = sim.result("deadlock");
++            r.trace = Some(sim.compress(&trace, None));
++            let st = h.stats(expansions, "deadlock", t0);
++            return (shorten(sim, sim.outcome(r, true, true)), st);
++        }
++    }
++    let st = h.stats(expansions, "frontier exhausted (every reachable state checked)", t0);
++    (sim.outcome(sim.result("ok"), true, true), st)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_options() {
++        let o = HuntOptions::parse("budget=2.5,rollout=10,strategy=uniform,eps=0").unwrap();
++        assert_eq!(o.budget_ms, Some(2500));
++        assert_eq!(o.rollout, 10);
++        assert_eq!(o.strategy, Strategy::Uniform);
++        assert_eq!(o.gt_eps, 0.0);
++        assert!(HuntOptions::parse("bogus=1").is_err());
++        assert!(HuntOptions::parse("rollout").is_err());
++    }
++
++    #[test]
++    fn beta_samples_lie_in_unit_interval_and_follow_the_mean() {
++        let mut rng = Rng::new(7, 0);
++        let n = 20000;
++        let mut sum = 0.0;
++        for _ in 0..n {
++            let x = beta(&mut rng, 3.0, 1.0);
++            assert!(x > 0.0 && x < 1.0);
++            sum += x;
++        }
++        let mean = sum / n as f64;
++        assert!((mean - 0.75).abs() < 0.01, "mean {}", mean);
++    }
++}
+diff --git a/src/wasm.rs b/src/wasm.rs
+index 53209ef..17e347d 100644
+--- a/src/wasm.rs
++++ b/src/wasm.rs
+@@ -102,6 +102,7 @@ pub unsafe extern "C" fn es_simulate(root: *mut u8, root_len: usize, cfg: *mut u
+         aril: if aril.is_nan() { 0 } else { aril as i64 },
+         check_deadlock: deadlock != 0,
+         trace_file: None,
++        hunt: None,
+     };
+     let json = run(&root, &cfg_text, deadlock != 0, Some(opts));
+     RESULT.with(|r| {
