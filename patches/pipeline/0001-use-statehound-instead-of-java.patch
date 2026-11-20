@@ -513,6 +513,19 @@ index f12a6e97..fc793517 100644
      client: Any = sdk.CopilotClient(
          connection=sdk.RuntimeConnection.for_stdio(path=shutil.which("copilot") or "copilot"),
          working_directory=state["cwd"],
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 00000000..945e1660
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,7 @@
++"""Defaults for the whole test suite."""
++
++import os
++
++# The launcher tests exercise the Java TLC path with a fake `java`. Keep them on that path even when
++# Statehound is installed in bin/ (STATEHOUND=off selects Java TLC; see scripts/tlc/run_model_check.sh).
++os.environ.setdefault("STATEHOUND", "off")
 diff --git a/tests/unit/test_context_control.py b/tests/unit/test_context_control.py
 index da936162..41f057a9 100644
 --- a/tests/unit/test_context_control.py

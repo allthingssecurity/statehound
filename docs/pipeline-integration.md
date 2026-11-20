@@ -41,7 +41,10 @@ is safe on machines without Statehound.
 ## Verified
 
 - The pipeline's own test suite (2,000+ unit tests, plus the invariant-checking tool's tests) has the
-  same results with the patch as without it.
+  same results with the patch as without it, in the same environment, both with and without Statehound
+  installed in `bin/`. The patch adds `tests/conftest.py`, which sets `STATEHOUND=off` for the suite so
+  that the launcher tests (which use a fake `java`) keep testing the Java path when Statehound is
+  installed.
 - With `lib/` removed entirely, the patched launcher runs a real check through Statehound and reports
   the violation; the pipeline's own `TLCOutputReader` parses Statehound's output.
 - Statehound stops its children within 3 s of the supervisor's SIGTERM (the pipeline allows 5 s), and
