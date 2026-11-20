@@ -6,8 +6,9 @@
 //!   invariant violation; the first violation found by either side is reported. A "no error" verdict
 //!   always comes from the exhaustive search: a hunter can only end a run by finding a real violation.
 //! * Identical checks are answered from a **content-addressed cache**.
-//! * TLC options that everystate does not implement (`-dumpTrace`, `-loadTrace`, `-continue`,
-//!   `-debugger`, ...) are rejected with a clear message instead of being silently ignored.
+//! * TLC options that everystate does not implement (`-continue`, `-debugger`, ...) are rejected with a
+//!   clear message instead of being silently ignored. With `-dumpTrace`/`-loadTrace` the run is decided
+//!   by the exhaustive search alone, so the trace file is always the one it writes.
 //!
 //! Environment:
 //!   STATEHOUND_EVERYSTATE      everystate binary (default: `everystate` on PATH)
@@ -201,7 +202,7 @@ impl Runner {
     fn run_everystate(&mut self, es: &str, inv: &args::Invocation, out: &mut dyn Write) -> (i32, Vec<String>) {
         let workers = workers_of(inv);
         let cfg_path = inv.config.as_ref().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(inv.spec.clone().unwrap_or_default().trim_end_matches(".tla").to_string() + ".cfg"));
-        let want_hunt = !inv.simulate && (has_invariants(&cfg_path) || !inv.no_deadlock);
+        let want_hunt = !inv.simulate && !inv.no_hunters && (has_invariants(&cfg_path) || !inv.no_deadlock);
         let default_hunters = if workers >= 2 { 2 } else { 1 };
         let hunters = if want_hunt { env("STATEHOUND_HUNTERS").and_then(|h| h.parse().ok()).unwrap_or(default_hunters) } else { 0 };
         let bfs_workers = workers;

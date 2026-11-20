@@ -615,6 +615,55 @@ index dc4e9f49..1e361ef7 100644
          return int(state_hash), label
  
      @staticmethod
+diff --git a/tools/inv_checking_tool/src/trace_replay_tool.py b/tools/inv_checking_tool/src/trace_replay_tool.py
+index 39d912fc..1e6c52ed 100644
+--- a/tools/inv_checking_tool/src/trace_replay_tool.py
++++ b/tools/inv_checking_tool/src/trace_replay_tool.py
+@@ -46,6 +46,22 @@ import os
+ from enum import Enum
+ 
+ 
++def _everystate_binary(root: str | None = None) -> str | None:
++    """The everystate binary (the pure-Rust TLC replacement installed by Statehound), or None.
++
++    Looked up in STATEHOUND_EVERYSTATE, then <root>/bin/everystate, then PATH."""
++    import shutil
++
++    for candidate in (
++        os.environ.get("STATEHOUND_EVERYSTATE"),
++        os.path.join(root, "bin", "everystate") if root else None,
++        shutil.which("everystate"),
++    ):
++        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
++            return candidate
++    return None
++
++
+ class TraceFormat(Enum):
+     """Supported trace input formats."""
+ 
+@@ -92,12 +108,15 @@ class TraceReplayer:
+         trace_format: TraceFormat,
+         java_opts: list[str] | None = None,
+     ) -> list[str]:
+-        """Build the TLC command for trace replay."""
+-        classpath = f"{self.tla_jar}:{self.community_jar}"
+-
+-        cmd = ["java"]
+-        cmd.extend(java_opts or ["-XX:+UseParallelGC", "-Xmx4G"])
+-        cmd.extend(["-cp", classpath, "tlc2.TLC"])
++        """Build the command for trace replay: everystate when installed, else Java TLC."""
++        everystate = _everystate_binary(os.environ.get("SPECULAR_ROOT") or os.path.dirname(os.path.dirname(self.tla_jar)))
++        if everystate:
++            cmd = [everystate]
++        else:
++            classpath = f"{self.tla_jar}:{self.community_jar}"
++            cmd = ["java"]
++            cmd.extend(java_opts or ["-XX:+UseParallelGC", "-Xmx4G"])
++            cmd.extend(["-cp", classpath, "tlc2.TLC"])
+ 
+         if config_file:
+             cmd.extend(["-config", config_file])
 diff --git a/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py b/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py
 index 916cc7b9..39c565ae 100644
 --- a/tools/trace_debugger/src/tla_mcp/handlers/trace_validation.py

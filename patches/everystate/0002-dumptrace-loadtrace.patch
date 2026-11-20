@@ -1,0 +1,1326 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index eec3217..5cd7ee7 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -332,7 +332,7 @@ impl Events for CliEvents<'_> {
+     }
+ }
+ 
+-const USAGE: &str = concat!("everystate ", env!("CARGO_PKG_VERSION"), " - a TLA+ model checker (TLC-compatible command line)\n\nUsage: everystate [options] SPEC[.tla]\n\n  -config FILE        configuration file (default: SPEC.cfg)\n  -deadlock           do not check for deadlock\n  -simulate [num=N][,file=PREFIX]   random simulation: generate N behaviors instead of all states\n                      (without num=N it runs until an error is found; with -json the default is 1000)\n  -depth N            simulation: maximal length of a behavior (default 100)\n  -seed N, -aril N    simulation: seed of the random choices (the same seed repeats the run)\n  -hunt [budget=S][,max=N][,rollout=N][,strategy=guided|uniform]   guided bug hunting: UCB restarts,\n                      Thompson-sampled actions, Boltzmann successor choice, Good-Turing stop (not exhaustive)\n  -tool               machine-readable output (TLC's -tool message framing)\n  -dump [dot[,actionlabels]] FILE   write the reachable state graph\n  -json               print a single JSON result object instead of TLC-style output\n  -workers N|auto     search with N threads (auto: one per core); the result is the same as with 1\n  -fp N, -lncheck S, -metadir DIR, ...   accepted for compatibility\n\n       everystate conform [options] -trace TRACE SPEC[.tla]\n\n  checks that a recorded run of the real system (JSON Lines) is a behaviour of the spec;\n  exit status 0 conforms, 20 does not conform (see: everystate conform -help)\n\nExit status: 0 success, 10 assumption, 11 deadlock, 12 safety, 13 liveness, 150 parse error, 151 config error.\n");
++const USAGE: &str = concat!("everystate ", env!("CARGO_PKG_VERSION"), " - a TLA+ model checker (TLC-compatible command line)\n\nUsage: everystate [options] SPEC[.tla]\n\n  -config FILE        configuration file (default: SPEC.cfg)\n  -deadlock           do not check for deadlock\n  -simulate [num=N][,file=PREFIX]   random simulation: generate N behaviors instead of all states\n                      (without num=N it runs until an error is found; with -json the default is 1000)\n  -depth N            simulation: maximal length of a behavior (default 100)\n  -seed N, -aril N    simulation: seed of the random choices (the same seed repeats the run)\n  -hunt [budget=S][,max=N][,rollout=N][,strategy=guided|uniform]   guided bug hunting: UCB restarts,\n                      Thompson-sampled actions, Boltzmann successor choice, Good-Turing stop (not exhaustive)\n  -tool               machine-readable output (TLC's -tool message framing)\n  -dump [dot[,actionlabels]] FILE   write the reachable state graph\n  -json               print a single JSON result object instead of TLC-style output\n  -dumpTrace json|tla FILE   write the counterexample to FILE in TLC's format (may be repeated)\n  -loadTrace json FILE       replay a trace written by -dumpTrace json (as a constraint and view)\n  -workers N|auto     search with N threads (auto: one per core); the result is the same as with 1\n  -fp N, -lncheck S, -metadir DIR, ...   accepted for compatibility\n\n       everystate conform [options] -trace TRACE SPEC[.tla]\n\n  checks that a recorded run of the real system (JSON Lines) is a behaviour of the spec;\n  exit status 0 conforms, 20 does not conform (see: everystate conform -help)\n\nExit status: 0 success, 10 assumption, 11 deadlock, 12 safety, 13 liveness, 150 parse error, 151 config error.\n");
+ 
+ /// The number of cores, which is what `-workers auto` means.
+ fn cores() -> usize {
+@@ -401,9 +401,27 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+     let mut dump: Option<Dump> = None;
+     let mut workers: usize = 1;
+     let mut sim = crate::simulate::SimArgs::default();
++    let mut dump_traces: Vec<crate::tracefile::DumpTrace> = vec![];
++    let mut load_trace: Option<String> = None;
+     let mut i = 0;
+     while i < argv.len() {
+         let a = argv[i].as_str();
++        // -dumpTrace FORMAT FILE and -loadTrace FORMAT FILE (TLC reads both flags case-insensitively)
++        if a.eq_ignore_ascii_case("-dumpTrace") || a.eq_ignore_ascii_case("-loadTrace") {
++            let dump = a.eq_ignore_ascii_case("-dumpTrace");
++            if i + 2 >= argv.len() {
++                host.print(if dump { "Error: Error: A format and a file name for dumping traces required.\n" } else { "Error: Error: A format and a file name for loading traces required.\n" });
++                return 1;
++            }
++            let (fmt, file) = (argv[i + 1].as_str(), argv[i + 2].clone());
++            let checked = if dump { crate::tracefile::dump_format(fmt).map(|format| dump_traces.push(crate::tracefile::DumpTrace { format, file })) } else { crate::tracefile::load_format(fmt).map(|_| load_trace = Some(file)) };
++            if let Err(e) = checked {
++                host.print(&format!("Error: {}\n", e));
++                return 1;
++            }
++            i += 3;
++            continue;
++        }
+         match a {
+             "-workers" => {
+                 i += 1;
+@@ -444,7 +462,6 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+                     dump = Some(Dump { file: x, dot: false, opts: String::new() });
+                 }
+             }
+-            "-dumpTrace" | "-loadTrace" => i += 2,
+             "-simulate" | "-hunt" | "-generate" | "-depth" | "-seed" | "-aril" => {
+                 if let Err(e) = sim.parse(argv, &mut i) {
+                     host.print(&format!("{}\n", e));
+@@ -493,6 +510,7 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+             cfg_path = in_dir;
+         }
+     }
++    crate::tracefile::set_load_trace(load_trace);
+     let rep = Reporter { tool, host: host.clone(), init_label: RefCell::new(None) };
+     let t0 = host.now_ms();
+     let parsed: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(vec![]));
+@@ -614,7 +632,7 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+         rep.msg(2185, 0, &format!("Starting... ({})", rep.now()));
+     }
+     if let Some(o) = &sim {
+-        let code = crate::simulate::run_cli(&rep, &model, o, deadlock, json, t0);
++        let code = crate::simulate::run_cli(&rep, &model, o, deadlock, json, t0, &dump_traces);
+         return if json { code } else { finish(code) };
+     }
+     let mut events = CliEvents { rep: &rep, json, first: true };
+@@ -627,13 +645,14 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+         }
+     }
+     if json {
++        crate::tracefile::write_dumps(&rep, &model, &res, &dump_traces, false, true);
+         host.print(&format!("{}\n", result_json(&model, &res, false)));
+         return exit_code(res.status);
+     }
+     if first {
+         rep.msg(2189, 0, "Computing initial states...");
+     }
+-    report(&rep, &model, &res, t0);
++    report(&rep, &model, &res, t0, &|| crate::tracefile::write_dumps(&rep, &model, &res, &dump_traces, false, false));
+     finish(if res.call_stack.is_some() {
+         75
+     } else if res.code == Some(2111) {
+@@ -647,9 +666,20 @@ pub fn run_cli(argv: &[String], host: HostRef, library_paths: &[String]) -> i32
+ /// (Tool.evalAlias and RecordValue.PrintTLCState).  `Ok(None)`: print the plain state.
+ /// `Err`: formatting threw, with the Java exception class and message.
+ fn alias_text(model: &Model, cur: &StateRef, nxt: &StateRef) -> Result<Option<String>, (String, String)> {
++    let fields = match alias_fields(model, cur, nxt) {
++        Some(f) => f,
++        None => return Ok(None),
++    };
++    alias_format(fields)
++}
++
++/// The fields of the ALIAS record for a trace state, in the order TLC keeps them (the order of the record
++/// constructor). `None`: no ALIAS, or it is not a record (the plain state is used). When evaluating the
++/// ALIAS fails, the variables and an `_ALIASEvalError` field.
++pub(crate) fn alias_fields(model: &Model, cur: &StateRef, nxt: &StateRef) -> Option<Vec<(String, crate::value::Value)>> {
+     let p = match &model.alias {
+         Some(p) => p,
+-        None => return Ok(None),
++        None => return None,
+     };
+     let ev = crate::eval::ev();
+     ev.set_state(cur, Some(nxt));
+@@ -679,7 +709,7 @@ fn alias_text(model: &Model, cur: &StateRef, nxt: &StateRef) -> Result<Option<St
+                 }
+             }
+         }
+-        Ok(_) => return Ok(None),
++        Ok(_) => return None,
+         Err(e) => match *e {
+             crate::intern::Fail::Tla(t) => {
+                 for (i, v) in model.vars.iter().enumerate() {
+@@ -687,9 +717,13 @@ fn alias_text(model: &Model, cur: &StateRef, nxt: &StateRef) -> Result<Option<St
+                 }
+                 fields.push(("_ALIASEvalError".into(), crate::value::Value::Str(str_id(&t.msg))));
+             }
+-            _ => return Ok(None),
++            _ => return None,
+         },
+     }
++    Some(fields)
++}
++
++fn alias_format(fields: Vec<(String, crate::value::Value)>) -> Result<Option<String>, (String, String)> {
+     let fi = fields.iter().position(|f| f.0 == "_format");
+     let format = match fi {
+         Some(i) => match &fields[i].1 {
+@@ -771,7 +805,10 @@ fn exp1(p: f64) -> String {
+     s.replace('e', "E")
+ }
+ 
+-pub(crate) fn report(rep: &Reporter, model: &Model, res: &CheckResult, t0: f64) {
++/// Prints the outcome of a run as TLC does. `dump` writes the counterexample files of `-dumpTrace`; it
++/// is called where TLC prints their "CounterExample written" lines: after the error trace, before the
++/// statistics. (Simulation writes them itself, after its statistics, and passes a no-op.)
++pub(crate) fn report(rep: &Reporter, model: &Model, res: &CheckResult, t0: f64, dump: &dyn Fn()) {
+     let progress_line = || {
+         let mins = ((rep.host.now_ms() - t0) / 60000.0).max(1e-6);
+         rep.msg(
+@@ -827,10 +864,12 @@ pub(crate) fn report(rep: &Reporter, model: &Model, res: &CheckResult, t0: f64)
+         }
+         "invariant-init" => {
+             rep.msg(2107, 1, &format!("Invariant {} is violated by the initial state:\n{}", name, first_state()));
++            dump();
+             return;
+         }
+         "implied-init" => {
+             rep.msg(2108, 1, &format!("Property {} is violated by the initial state:\n{}", name, first_state()));
++            dump();
+             return;
+         }
+         "invariant" => rep.msg(2110, 1, &format!("Invariant {} is violated.", name)),
+@@ -855,6 +894,7 @@ pub(crate) fn report(rep: &Reporter, model: &Model, res: &CheckResult, t0: f64)
+             if rep.init_label.borrow().is_some() {
+                 return; // simulation prints its own statistics
+             }
++            dump();
+             rep.msg(2267, 0, &format!("Finished checking temporal properties in 00s at {}", rep.now()));
+             if rep.tool {
+                 progress_line();
+@@ -889,6 +929,7 @@ pub(crate) fn report(rep: &Reporter, model: &Model, res: &CheckResult, t0: f64)
+         rep.msg(2121, 1, "The behavior up to this point is:");
+         print_trace(rep, model, res);
+     }
++    dump();
+     if let Some(cs) = &res.call_stack {
+         rep.msg(2103, 1, &format!("The error occurred when TLC was evaluating the nested\nexpressions at the following positions:\n{}", cs));
+     }
+diff --git a/src/community.rs b/src/community.rs
+index 6d725d3..597bdcd 100644
+--- a/src/community.rs
++++ b/src/community.rs
+@@ -285,7 +285,7 @@ fn are_connected_in(kind: &str, parse: Endpoints, mode: Mode, m: &Value, n: &Val
+ }
+ 
+ // ---- JSON (Json.java, which uses Gson) ----
+-fn json_str(s: &str, o: &mut String) {
++pub(crate) fn json_str(s: &str, o: &mut String) {
+     o.push('"');
+     for c in s.chars() {
+         match c {
+@@ -364,7 +364,7 @@ fn json_node(ev: &Evaluator, v: &Value, o: &mut String) -> R<()> {
+     }
+     Ok(())
+ }
+-fn to_json(ev: &Evaluator, v: &Value) -> R<String> {
++pub(crate) fn to_json(ev: &Evaluator, v: &Value) -> R<String> {
+     let mut o = String::new();
+     json_node(ev, v, &mut o)?;
+     Ok(o)
+diff --git a/src/lib.rs b/src/lib.rs
+index a1e64c3..0673519 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod simulate;
+ pub mod stdlib;
+ pub mod stepcache;
+ pub mod stepstats;
++pub mod tracefile;
+ pub mod tshash;
+ pub mod value;
+ #[cfg(target_arch = "wasm32")]
+diff --git a/src/model.rs b/src/model.rs
+index f63cfbc..9890d58 100644
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -510,7 +510,7 @@ pub fn build_model(root_name: &str, resolve: SourceResolver, cfg: &Config, host:
+     for n in &cfg.action_constraints {
+         action_constraints.push(Pred { name: n.clone(), e: mk_app(n, get_def(n, "action constraint")?), ctx: None });
+     }
+-    let view = match &cfg.view {
++    let mut view = match &cfg.view {
+         Some(v) => Some(Pred { name: v.clone(), e: mk_app(v, get_def(v, "view")?), ctx: None }),
+         None => None,
+     };
+@@ -560,6 +560,25 @@ pub fn build_model(root_name: &str, resolve: SourceResolver, cfg: &Config, host:
+         }
+     }
+ 
++    // -loadTrace json: TLC adds the constraint of module _JsonTrace after those of the configuration, and
++    // its view unless the configuration has one
++    if let Some(file) = crate::tracefile::load_trace() {
++        crate::tracefile::prepare_load_trace(&file);
++        let jm = loader.load(name("_JsonTrace"), None)?;
++        for (op, is_view) in [("_JsonTraceConstraint", false), ("_JsonTraceView", true)] {
++            let d = match jm.syms.get(name(op)) {
++                Some(Sym::Def(d)) => d,
++                _ => unreachable!(),
++            };
++            let p = Pred { name: op.to_string(), e: mk_app(op, Sym::Def(d)), ctx: None };
++            if !is_view {
++                constraints.push(p);
++            } else if view.is_none() {
++                view = Some(p);
++            }
++        }
++    }
++
+     // ---- behaviour spec ----
+     if let Some(spec) = &cfg.spec {
+         if cfg.init.is_some() || cfg.next.is_some() {
+diff --git a/src/simulate.rs b/src/simulate.rs
+index 558c239..c4e4ddb 100644
+--- a/src/simulate.rs
++++ b/src/simulate.rs
+@@ -799,7 +799,7 @@ pub fn sim_json(model: &Model, out: &SimOutcome, opts: &SimOptions, extended: bo
+ }
+ 
+ /// Runs a simulation for the command line and prints TLC's output; returns the exit status.
+-pub(crate) fn run_cli(rep: &Reporter, model: &Model, opts: &SimOptions, deadlock: bool, json: bool, t0: f64) -> i32 {
++pub(crate) fn run_cli(rep: &Reporter, model: &Model, opts: &SimOptions, deadlock: bool, json: bool, t0: f64, dumps: &[crate::tracefile::DumpTrace]) -> i32 {
+     let mut opts = opts.clone();
+     opts.check_deadlock = deadlock && model.check_deadlock;
+     *rep.init_label.borrow_mut() = Some(init_label(model));
+@@ -815,6 +815,7 @@ pub(crate) fn run_cli(rep: &Reporter, model: &Model, opts: &SimOptions, deadlock
+         exit_code(res.status)
+     };
+     if json {
++        crate::tracefile::write_dumps(rep, model, res, dumps, true, true);
+         rep.host.print(&format!("{}\n", sim_json(model, &out, &opts, false)));
+         return code;
+     }
+@@ -834,10 +835,12 @@ pub(crate) fn run_cli(rep: &Reporter, model: &Model, opts: &SimOptions, deadlock
+         summary();
+         return code;
+     }
+-    report(rep, model, res, t0);
++    report(rep, model, res, t0, &|| {});
+     if out.summary {
+         summary();
+     }
++    // TLC's simulator evaluates the postconditions of -dumpTrace after its statistics
++    crate::tracefile::write_dumps(rep, model, res, dumps, true, false);
+     if out.final_progress {
+         progress_line(rep, &out.stats);
+     }
+diff --git a/src/stdlib.rs b/src/stdlib.rs
+index 935da60..daadb5d 100644
+--- a/src/stdlib.rs
++++ b/src/stdlib.rs
+@@ -1050,8 +1050,14 @@ pub fn build_stdlib() -> HashMap<Name, Rc<ModuleInfo>> {
+     });
+     let possible = m.done();
+ 
++    // ---- _JsonTrace (support module of -loadTrace json: the constraint and view that replay a trace) ----
++    let mut m = MB::new("_JsonTrace", &[]);
++    m.op("_JsonTraceConstraint", 0, |ev, _| crate::tracefile::constraint(ev));
++    m.op("_JsonTraceView", 0, |ev, _| crate::tracefile::view(ev));
++    let json_trace = m.done();
++
+     let mut out = HashMap::new();
+-    for x in [naturals, integers, reals, sequences, finite_sets, tlc, tlcext, bags, randomization, possible] {
++    for x in [naturals, integers, reals, sequences, finite_sets, tlc, tlcext, bags, randomization, possible, json_trace] {
+         out.insert(x.name.unwrap(), x);
+     }
+     out
+@@ -1146,6 +1152,11 @@ fn read_text(path: &str) -> R<String> {
+     }
+ }
+ 
++/// `JsonDeserialize(path)`: the JSON document in the file as TLA+ values.
++pub(crate) fn json_deserialize(path: &str) -> R<Value> {
++    JsonReader::new(&read_text(path)?).document()
++}
++
+ /// JSON -> TLA+ values, like the community module's Java override (arrays are sequences, objects records).
+ struct JsonReader {
+     s: Vec<char>,
+diff --git a/src/tracefile.rs b/src/tracefile.rs
+new file mode 100644
+index 0000000..a809942
+--- /dev/null
++++ b/src/tracefile.rs
+@@ -0,0 +1,769 @@
++//! TLC's `-dumpTrace FORMAT FILE` and `-loadTrace FORMAT FILE`.
++//!
++//! TLC implements both with TLA+ modules of tla2tools.jar. `-dumpTrace json F` adds the POSTCONDITION
++//! `_JsonTrace`, which serializes TLCExt!CounterExample (a record of a set of `<<n, state>>` pairs and a
++//! set of `<<from, action, to>>` edges) with Json!JsonSerialize, together with the variable names, and
++//! prints "CounterExample written: F"; `-dumpTrace tla F` writes ToString(CounterExample) as a module.
++//! `-loadTrace json F` adds the CONSTRAINT `_JsonTraceConstraint` (the state at level L agrees with the
++//! L-th state of the file on the variables the two have in common) and, unless the configuration has a
++//! VIEW, the VIEW `_JsonTraceView` (<<level, state>>, with the level past the end of a lasso mapped to
++//! the state the lasso returns to), so that model checking replays the trace.
++//!
++//! Here the counterexample is built from the checker's result and encoded from the values themselves,
++//! with the encoder of the Json module (`community::to_json`) and TLC's value printer (`fmt`), and
++//! the constraint and view of `-loadTrace` are native operators of a built-in module `_JsonTrace`.
++use crate::checker::CheckResult;
++use crate::cli::{alias_fields, Reporter};
++use crate::eval::{Evaluator, StateRef};
++use crate::intern::*;
++use crate::model::Model;
++use crate::value::*;
++use std::cell::RefCell;
++use std::rc::Rc;
++use std::sync::Mutex;
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum DumpFormat {
++    Json,
++    Tla,
++}
++
++/// One `-dumpTrace FORMAT FILE` of the command line.
++#[derive(Clone, Debug)]
++pub struct DumpTrace {
++    pub format: DumpFormat,
++    pub file: String,
++}
++
++/// The format of `-dumpTrace FORMAT` (TLC compares case-insensitively). Err: the message for an unknown
++/// format (TLC's wording) or for one of TLC's other formats, which everystate does not write.
++pub fn dump_format(fmt: &str) -> Result<DumpFormat, String> {
++    match fmt.to_ascii_lowercase().as_str() {
++        "json" => Ok(DumpFormat::Json),
++        "tla" => Ok(DumpFormat::Tla),
++        "tlc" => Err("Error: -dumpTrace tlc (TLC's binary trace format, Java value serialization) is not supported by everystate; use -dumpTrace json or -dumpTrace tla.".into()),
++        "tlcplain" | "tlctespec" | "tlcaction" | "dot" => Err(format!("Error: -dumpTrace {} is not supported by everystate; use -dumpTrace json or -dumpTrace tla.", fmt)),
++        _ => Err(format!("Error: Unknown format {} given to -dumpTrace.", fmt)),
++    }
++}
++
++/// Checks the format of `-loadTrace FORMAT`. Only TLC's JSON traces can be loaded.
++pub fn load_format(fmt: &str) -> Result<(), String> {
++    match fmt.to_ascii_lowercase().as_str() {
++        "json" => Ok(()),
++        "tlc" => Err("Error: -loadTrace tlc is not supported by everystate: TLC's binary trace format is Java value serialization tied to TLC's internal string table. Dump the trace with -dumpTrace json and load it with -loadTrace json.".into()),
++        _ => Err(format!("Error: Unknown format {} given to -loadTrace.", fmt)),
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// the counterexample
++
++/// The action of an edge of a counterexample (TLC's `RecordValue(Action)`).
++#[derive(Clone)]
++pub struct CeAction {
++    pub name: String,
++    pub loc: Loc,
++    pub module: String,
++    /// the parameters of the action's definition and their values (TLC's `context` and `parameters`)
++    pub params: Vec<(String, Value)>,
++}
++impl CeAction {
++    /// `Action.UNKNOWN`, which TLC records for a stuttering step it has no action for.
++    fn unnamed() -> CeAction {
++        CeAction { name: "UnnamedAction".into(), loc: [0; 4], module: "--TLA+ BUILTINS--".into(), params: vec![] }
++    }
++    fn of(model: &Model, a: Option<usize>) -> CeAction {
++        match a.and_then(|a| model.actions.get(a)) {
++            Some(a) => CeAction { name: a.name.clone(), loc: a.loc, module: a.module.clone(), params: a.param_vals.clone() },
++            None => CeAction::unnamed(),
++        }
++    }
++}
++
++/// TLCExt!CounterExample: the states (record fields in TLC's order; `Value::Undef` for a variable a
++/// simulation left unassigned) and the edges between them (indices into `states`).
++pub struct CounterExample {
++    pub states: Vec<Vec<(String, Value)>>,
++    pub edges: Vec<(usize, CeAction, usize)>,
++}
++
++impl CounterExample {
++    /// The counterexample TLC hands to its postconditions for this result, or `None` when TLC has none:
++    /// in model checking only for violations (invariants, properties, deadlock), in simulation for every
++    /// error with a behaviour.
++    pub fn of(model: &Model, res: &CheckResult, sim: bool) -> Option<CounterExample> {
++        let tr = res.trace.as_ref()?;
++        if tr.is_empty() {
++            return None;
++        }
++        let init_only = matches!(res.status, "invariant-init" | "implied-init");
++        if sim {
++            // an error while working on an initial state, or a check TLC's simulator does not make
++            if res.status == "implied-init" || (tr.len() == 1 && tr[0].id == -1 && tr[0].action.is_none() && !init_only) {
++                return None;
++            }
++        } else if !matches!(res.status, "invariant" | "invariant-init" | "implied-init" | "deadlock" | "action-property" | "liveness") {
++            return None;
++        }
++        let live = res.status == "liveness";
++        let plain = |s: &StateRef| -> Vec<(String, Value)> { model.vars.iter().enumerate().map(|(i, v)| (v.name.to_string(), s.get(i))).collect() };
++        let n = tr.len();
++        let mut states = Vec::with_capacity(n);
++        for i in 0..n {
++            let s = &tr[i].state;
++            // TLC evaluates the ALIAS for the states of the counterexample except for a violation by an
++            // initial state and a lasso of model checking; the state paired with the last one is itself.
++            // (Its simulator pairs each state of a lasso with the one before.)
++            let fields = if model.alias.is_none() || init_only || (live && !sim) {
++                None
++            } else if live {
++                alias_fields(model, s, &tr[i.saturating_sub(1)].state)
++            } else {
++                alias_fields(model, s, tr.get(i + 1).map_or(s, |t| &t.state))
++            };
++            states.push(fields.unwrap_or_else(|| plain(s)));
++        }
++        let mut edges: Vec<(usize, CeAction, usize)> = (1..n).map(|i| (i - 1, CeAction::of(model, tr[i].action), i)).collect();
++        if live {
++            match res.loop_to {
++                Some(l) if l >= 0 && (l as usize) < n => edges.push((n - 1, CeAction::of(model, res.loop_action), l as usize)),
++                Some(_) => {
++                    // stuttering: model checking names the action of the last state (none for an initial
++                    // state); the simulator has no action for it
++                    let a = if sim || n == 1 { CeAction::unnamed() } else { CeAction::of(model, tr[n - 1].action) };
++                    edges.push((n - 1, a, n - 1));
++                }
++                None => {}
++            }
++        }
++        Some(CounterExample { states, edges })
++    }
++
++    /// `UNION { DOMAIN trace[i] : i \in DOMAIN trace }`: the field names, in the order of TLC's sets of
++    /// strings.
++    pub fn vars(&self) -> Vec<String> {
++        let mut ids: Vec<StrId> = vec![];
++        for s in &self.states {
++            for (k, _) in s {
++                let id = str_id(k);
++                if !ids.contains(&id) {
++                    ids.push(id);
++                }
++            }
++        }
++        ids.sort_by_key(|i| i.0);
++        ids.into_iter().map(|i| str_of(i).to_string()).collect()
++    }
++
++    /// The file `-dumpTrace json` writes: `{"counterexample":{"action":[..],"state":[..]},"vars":[..]}`.
++    /// Err: the message of the Json module when a value cannot be encoded.
++    pub fn to_json(&self, ev: &Evaluator) -> R<String> {
++        let state_json = |i: usize, o: &mut String| -> R<()> {
++            o.push('[');
++            o.push_str(&(i + 1).to_string());
++            o.push_str(",{");
++            for (j, (k, v)) in self.states[i].iter().enumerate() {
++                if j > 0 {
++                    o.push(',');
++                }
++                crate::community::json_str(k, o);
++                o.push(':');
++                if matches!(v, Value::Undef) {
++                    // what Gson makes of TLC's null value
++                    return eval_err(
++                        "Attempted to apply the operator overridden by the Java method\npublic static synchronized tlc2.value.impl.BoolValue tlc2.overrides.Json.serialize(tlc2.value.impl.StringValue,tlc2.value.impl.Value) throws java.io.IOException,\nbut it produced the following error:\nCannot invoke \"Object.getClass()\" because \"<parameter1>\" is null".into(),
++                    );
++                }
++                o.push_str(&crate::community::to_json(ev, v)?);
++            }
++            o.push_str("}]");
++            Ok(())
++        };
++        let mut o = String::from("{\"counterexample\":{\"action\":[");
++        for (k, (from, a, to)) in self.edges.iter().enumerate() {
++            if k > 0 {
++                o.push(',');
++            }
++            o.push('[');
++            state_json(*from, &mut o)?;
++            o.push_str(",{\"name\":");
++            crate::community::json_str(&a.name, &mut o);
++            o.push_str(&format!(",\"location\":{{\"beginLine\":{},\"beginColumn\":{},\"endLine\":{},\"endColumn\":{},\"module\":", a.loc[0], a.loc[1], a.loc[2], a.loc[3]));
++            crate::community::json_str(&a.module, &mut o);
++            o.push('}');
++            if !a.params.is_empty() {
++                o.push_str(",\"context\":{");
++                for (j, (p, v)) in a.params.iter().enumerate() {
++                    if j > 0 {
++                        o.push(',');
++                    }
++                    crate::community::json_str(p, &mut o);
++                    o.push(':');
++                    o.push_str(&crate::community::to_json(ev, v)?);
++                }
++                o.push_str("},\"parameters\":[");
++                for (j, (p, _)) in a.params.iter().enumerate() {
++                    if j > 0 {
++                        o.push(',');
++                    }
++                    crate::community::json_str(p, &mut o);
++                }
++                o.push(']');
++            }
++            o.push_str("},");
++            state_json(*to, &mut o)?;
++            o.push(']');
++        }
++        o.push_str("],\"state\":[");
++        for i in 0..self.states.len() {
++            if i > 0 {
++                o.push(',');
++            }
++            state_json(i, &mut o)?;
++        }
++        o.push_str("]},\"vars\":[");
++        for (j, v) in self.vars().iter().enumerate() {
++            if j > 0 {
++                o.push(',');
++            }
++            crate::community::json_str(v, &mut o);
++        }
++        o.push_str("]}");
++        Ok(o)
++    }
++
++    /// The file `-dumpTrace tla FILE` writes: a module named after FILE (its first ".tla" removed, as
++    /// TLC's ReplaceFirstSubSeq does) defining `CounterExample` as TLC prints the value.
++    pub fn to_tla(&self, file: &str) -> String {
++        let state_tla = |i: usize, o: &mut String| {
++            o.push_str(&format!("<<{}, [", i + 1));
++            for (j, (k, v)) in self.states[i].iter().enumerate() {
++                if j > 0 {
++                    o.push_str(", ");
++                }
++                o.push_str(k);
++                o.push_str(" |-> ");
++                if matches!(v, Value::Undef) {
++                    o.push_str("null");
++                } else {
++                    fmt_into(v, o);
++                }
++            }
++            o.push_str("]>>");
++        };
++        let mut o = String::from("[action |-> {");
++        for (k, (from, a, to)) in self.edges.iter().enumerate() {
++            if k > 0 {
++                o.push_str(", ");
++            }
++            o.push_str("<<");
++            state_tla(*from, &mut o);
++            o.push_str(", [name |-> ");
++            fmt_str(&a.name, &mut o);
++            o.push_str(&format!(", location |-> [beginLine |-> {}, beginColumn |-> {}, endLine |-> {}, endColumn |-> {}, module |-> ", a.loc[0], a.loc[1], a.loc[2], a.loc[3]));
++            fmt_str(&a.module, &mut o);
++            o.push(']');
++            if !a.params.is_empty() {
++                o.push_str(", context |-> [");
++                for (j, (p, v)) in a.params.iter().enumerate() {
++                    if j > 0 {
++                        o.push_str(", ");
++                    }
++                    o.push_str(p);
++                    o.push_str(" |-> ");
++                    fmt_into(v, &mut o);
++                }
++                o.push_str("], parameters |-> <<");
++                for (j, (p, _)) in a.params.iter().enumerate() {
++                    if j > 0 {
++                        o.push_str(", ");
++                    }
++                    fmt_str(p, &mut o);
++                }
++                o.push_str(">>");
++            }
++            o.push_str("], ");
++            state_tla(*to, &mut o);
++            o.push_str(">>");
++        }
++        o.push_str("}, state |-> {");
++        for i in 0..self.states.len() {
++            if i > 0 {
++                o.push_str(", ");
++            }
++            state_tla(i, &mut o);
++        }
++        o.push_str("}]");
++        let module = file.replacen(".tla", "", 1);
++        format!("---- MODULE {} ----\nLOCAL INSTANCE TLC\n\nCounterExample == \n\t{}\n\n====", module, o)
++    }
++}
++
++/// Writes the counterexample of `res` to the files of the `-dumpTrace` options, in their order, and
++/// prints TLC's line for each file written (not with `-json`, whose output is a single JSON object).
++/// Nothing is written when TLC has no counterexample for the result. As in TLC, a dump that fails
++/// stops the ones after it.
++pub(crate) fn write_dumps(rep: &Reporter, model: &Model, res: &CheckResult, dumps: &[DumpTrace], sim: bool, json: bool) {
++    if dumps.is_empty() {
++        return;
++    }
++    let ce = match CounterExample::of(model, res, sim) {
++        Some(c) => c,
++        None => return,
++    };
++    for d in dumps {
++        let (text, at) = match d.format {
++            DumpFormat::Json => (ce.to_json(model.ev), "_JsonTrace at line 11, col 5 to line 15, col 63 of module _JsonTrace"),
++            DumpFormat::Tla => (Ok(ce.to_tla(&d.file)), "_TLAPlusCounterExample at line 19, col 5 to line 28, col 75 of module _TLAPlusCounterExample"),
++        };
++        let written = match text {
++            Ok(t) => rep.host.write_file(&d.file, t.as_bytes()),
++            Err(e) => {
++                // TLC opens the file before encoding the value
++                let _ = rep.host.write_file(&d.file, b"");
++                Err(match *e {
++                    Fail::Tla(t) => t.msg,
++                    _ => "internal error".into(),
++                })
++            }
++        };
++        match written {
++            Ok(()) => {
++                if !json {
++                    let mut line = String::new();
++                    fmt_str(&format!("CounterExample written: {}", d.file), &mut line);
++                    rep.plain(&line);
++                }
++            }
++            Err(msg) => {
++                if !json {
++                    rep.msg(2405, 1, &format!("Evaluating postcondition {} failed.\n{}", at, msg));
++                }
++                return;
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// -loadTrace json
++
++/// The file of `-loadTrace json`, for every model built in this process (the workers of a parallel
++/// search build their own model and read it too).
++static LOAD_TRACE: Mutex<Option<String>> = Mutex::new(None);
++
++pub fn set_load_trace(file: Option<String>) {
++    *LOAD_TRACE.lock().unwrap_or_else(|e| e.into_inner()) = file;
++}
++pub fn load_trace() -> Option<String> {
++    LOAD_TRACE.lock().unwrap_or_else(|e| e.into_inner()).clone()
++}
++
++/// A trace read with `-loadTrace json`: the states of `counterexample.state` (by position), the names
++/// of `vars` (sorted as TLC's set of them) and the state the lasso returns to (0: no lasso).
++struct Loaded {
++    states: Vec<Value>,
++    vars: Vec<StrId>,
++    lasso_target: i64,
++}
++
++thread_local! {
++    static LOADED: RefCell<Option<Rc<Result<Loaded, String>>>> = const { RefCell::new(None) };
++}
++
++/// Reads the trace file for the model being built on this thread. A file that cannot be read or does
++/// not have the shape of a dumped trace is reported when the constraint is first evaluated, as TLC does.
++pub fn prepare_load_trace(file: &str) {
++    let r = read_loaded(file);
++    LOADED.with(|l| *l.borrow_mut() = Some(Rc::new(r)));
++}
++
++fn read_loaded(file: &str) -> Result<Loaded, String> {
++    let msg = |e: Box<Fail>| match *e {
++        Fail::Tla(t) => t.msg,
++        _ => "internal error".to_string(),
++    };
++    let dump = match crate::stdlib::json_deserialize(file) {
++        Ok(v) => v,
++        Err(e) => {
++            return Err(format!(
++                "Attempted to apply the operator overridden by the Java method\npublic static tlc2.value.IValue tlc2.overrides.Json.deserialize(tlc2.value.impl.StringValue) throws java.io.IOException,\nbut it produced the following error:\n{}",
++                msg(e)
++            ))
++        }
++    };
++    let field = |v: &Value, f: &str| -> Result<Value, String> {
++        match v {
++            Value::Record(r) => r.get(str_id(f)).cloned().ok_or_else(|| format!("Attempted to access nonexistent field '{}' of record\n{}", f, fmt(v))),
++            _ => Err(format!("Attempted to apply the operator \"{}\" to the non-record value\n{}", f, fmt(v))),
++        }
++    };
++    let elems = |v: &Value| -> Result<Vec<Value>, String> {
++        match v {
++            Value::Tuple(t) => Ok(t.to_vec()),
++            _ => Err(format!("The trace file {} does not hold a trace dumped with -dumpTrace json:\n{}", file, fmt(v))),
++        }
++    };
++    let ce = field(&dump, "counterexample")?;
++    let mut states = vec![];
++    for s in elems(&field(&ce, "state")?)? {
++        match &s {
++            Value::Tuple(t) if t.len() >= 2 => states.push(t[1].clone()),
++            _ => return Err(format!("Attempted to apply function:\n{}\nto argument 2, which is not in the domain of the function.", fmt(&s))),
++        }
++    }
++    let mut vars: Vec<StrId> = vec![];
++    for v in elems(&field(&dump, "vars")?)? {
++        match v {
++            Value::Str(s) => {
++                if !vars.contains(&s) {
++                    vars.push(s)
++                }
++            }
++            x => return Err(format!("The trace file {} names a variable that is not a string: {}", file, fmt(&x))),
++        }
++    }
++    vars.sort_by_key(|s| s.0);
++    // the edge that closes a lasso is the one that does not lead to a later state
++    let num = |v: &Value| -> Option<i64> {
++        match v {
++            Value::Tuple(t) => match t.first() {
++                Some(Value::Int(n)) => Some(*n),
++                _ => None,
++            },
++            _ => None,
++        }
++    };
++    let mut lasso_target = 0;
++    for a in elems(&field(&ce, "action")?)? {
++        if let Value::Tuple(t) = &a {
++            if t.len() >= 3 {
++                if let (Some(from), Some(to)) = (num(&t[0]), num(&t[2])) {
++                    if to <= from {
++                        lasso_target = to;
++                        break;
++                    }
++                }
++            }
++        }
++    }
++    Ok(Loaded { states, vars, lasso_target })
++}
++
++fn loaded() -> R<Rc<Result<Loaded, String>>> {
++    match LOADED.with(|l| l.borrow().clone()) {
++        Some(l) => Ok(l),
++        None => eval_err("No trace was loaded with -loadTrace.".into()),
++    }
++}
++
++/// `_JsonTraceConstraint`: the state at level L agrees with the L-th state of the trace on the
++/// variables that are both variables of the spec and of the trace (any state past the end of the trace
++/// is allowed).
++pub fn constraint(ev: &Evaluator) -> R<Value> {
++    ev.st_touch.set(ev.st_touch.get() + 1);
++    let l = loaded()?;
++    let lt = match &*l {
++        Ok(lt) => lt,
++        Err(m) => return eval_err(m.clone()),
++    };
++    let level = ev.stats.level.get();
++    if level < 1 || level as usize > lt.states.len() {
++        return Ok(Value::Bool(true));
++    }
++    let want = &lt.states[level as usize - 1];
++    let cur = ev.cur.borrow().clone();
++    let names = ev.var_names.borrow().clone();
++    for v in &lt.vars {
++        let vs = str_of(*v);
++        let i = match names.iter().position(|n| *name_str(*n) == *vs) {
++            Some(i) => i,
++            None => continue,
++        };
++        let w = match want {
++            Value::Record(r) => match r.get(*v) {
++                Some(w) => w.clone(),
++                None => return eval_err(format!("Attempted to access nonexistent field '{}' of record\n{}", vs, fmt(want))),
++            },
++            _ => return eval_err(format!("Attempted to apply the operator \"{}\" to the non-record value\n{}", vs, fmt(want))),
++        };
++        if !tlc_eq(&cur.get(i), &w)? {
++            return Ok(Value::Bool(false));
++        }
++    }
++    Ok(Value::Bool(true))
++}
++
++fn fcn_like(v: &Value) -> bool {
++    matches!(v, Value::Tuple(_) | Value::Record(_) | Value::Fcn(_))
++}
++
++/// TLC's `a.equals(b)` for a value of the state and a value read from JSON (arrays are tuples, objects
++/// records). everystate keeps functions in canonical form (domain 1..n: tuple; strings: record), where
++/// two different forms are simply unequal; TLC compares the domains of a function and a record or tuple
++/// element by element, which fails for an integer and a string (a function with domain 0..n against a
++/// JSON object, say). The other values compare as everywhere else.
++fn tlc_eq(a: &Value, b: &Value) -> R<bool> {
++    match (a, b) {
++        (Value::Tuple(x), Value::Tuple(y)) => {
++            if x.len() != y.len() {
++                return Ok(false);
++            }
++            for i in 0..x.len() {
++                if !tlc_eq(&x[i], &y[i])? {
++                    return Ok(false);
++                }
++            }
++            Ok(true)
++        }
++        (Value::Record(x), Value::Record(y)) => {
++            if x.names[..] != y.names[..] {
++                return Ok(false);
++            }
++            for i in 0..x.vals.len() {
++                if !tlc_eq(&x.vals[i], &y.vals[i])? {
++                    return Ok(false);
++                }
++            }
++            Ok(true)
++        }
++        (Value::Fcn(x), Value::Fcn(y)) => {
++            if x.dom.len() != y.dom.len() {
++                return Ok(false);
++            }
++            for i in 0..x.dom.len() {
++                if !val_eq(&x.dom[i], &y.dom[i])? {
++                    return Ok(false);
++                }
++            }
++            for i in 0..x.vals.len() {
++                if !tlc_eq(&x.vals[i], &y.vals[i])? {
++                    return Ok(false);
++                }
++            }
++            Ok(true)
++        }
++        _ if fcn_like(a) && fcn_like(b) => fcn_eq(a, b),
++        _ => val_eq(a, b),
++    }
++}
++
++/// FcnRcdValue / RecordValue / TupleValue.equals for two functions of different canonical forms.
++fn fcn_eq(a: &Value, b: &Value) -> R<bool> {
++    let not_int = |d: &Value| eval_err(format!("Attempted to compare an integer with non-integer:\n{}.", fmt(d)));
++    let pairs = |v: &Value| -> R<(Vec<Value>, Vec<Value>)> { Ok((domain_elems(v)?.to_vec(), fcn_values(v)?.to_vec())) };
++    match a {
++        // TupleValue.equals: a non-tuple is compared with the tuple as a function (domain 1..n)
++        Value::Tuple(_) => fcn_eq_intv(a, 1, b),
++        // RecordValue.equals: anything that is not a record is an error
++        Value::Record(_) => eval_err(format!("Attempted to check equality of record:\n{}\nwith non-record\n{}", fmt(a), fmt(b))),
++        _ => {
++            let (da, va) = pairs(a)?;
++            let (db, vb) = pairs(b)?;
++            // TLC keeps the domain of a function as an interval (FcnRcdValue.intv) when it was built over
++            // one, [i \in 0..N |-> ..], and as an array when it was built with :> and @@; the form is not
++            // kept here, so consecutive integers count as an interval, except a single one (d :> v)
++            let lo = match da.first() {
++                Some(Value::Int(l)) if da.len() > 1 && da.iter().enumerate().all(|(i, d)| matches!(d, Value::Int(x) if *x == l + i as i64)) => Some(*l),
++                _ => None,
++            };
++            if let Some(l) = lo {
++                return fcn_eq_intv(a, l, b);
++            }
++            if da.len() != db.len() {
++                return Ok(false);
++            }
++            if matches!(b, Value::Tuple(_)) {
++                for (i, d) in da.iter().enumerate() {
++                    match d {
++                        Value::Int(x) if *x == 1 + i as i64 => {}
++                        Value::Int(_) => return Ok(false),
++                        _ => return not_int(d),
++                    }
++                }
++            } else {
++                for i in 0..da.len() {
++                    if !scalar_eq(&da[i], &db[i])? {
++                        return Ok(false);
++                    }
++                }
++            }
++            for i in 0..va.len() {
++                if !tlc_eq(&va[i], &vb[i])? {
++                    return Ok(false);
++                }
++            }
++            Ok(true)
++        }
++    }
++}
++
++/// IntValue / StringValue.equals for the elements of two domains, with TLC's messages.
++fn scalar_eq(a: &Value, b: &Value) -> R<bool> {
++    match (a, b) {
++        (Value::Int(_), Value::Int(_) | Value::Model(_)) | (Value::Str(_), Value::Str(_) | Value::Model(_)) => val_eq(a, b),
++        (Value::Int(_), _) => eval_err(format!("Attempted to check equality of integer {} with non-integer:\n{}", fmt(a), fmt(b))),
++        (Value::Str(_), _) => eval_err(format!("Attempted to check equality of string {} with non-string:\n{}", fmt(a), fmt(b))),
++        _ => tlc_eq(a, b),
++    }
++}
++
++/// FcnRcdValue.equals of a function whose domain is the interval lo..lo+n-1 with another function.
++fn fcn_eq_intv(a: &Value, lo: i64, b: &Value) -> R<bool> {
++    let va = fcn_values(a)?.to_vec();
++    let (db, vb) = (domain_elems(b)?.to_vec(), fcn_values(b)?.to_vec());
++    if matches!(b, Value::Tuple(_)) {
++        // two intervals: equal only if they are the same interval
++        if !(db.len() == va.len() && (va.is_empty() || lo == 1)) {
++            return Ok(false);
++        }
++    } else {
++        if db.len() != va.len() {
++            return Ok(false);
++        }
++        for (i, d) in db.iter().enumerate() {
++            match d {
++                Value::Int(x) if *x == lo + i as i64 => {}
++                Value::Int(_) => return Ok(false),
++                _ => return eval_err(format!("Attempted to compare an integer with non-integer:\n{}.", fmt(d))),
++            }
++        }
++    }
++    for i in 0..va.len() {
++        if !tlc_eq(&va[i], &vb[i])? {
++            return Ok(false);
++        }
++    }
++    Ok(true)
++}
++
++/// `_JsonTraceView`: <<level, state>>, where a level past the end of the trace is that of the state the
++/// lasso returns to (so that the lasso closes).
++pub fn view(ev: &Evaluator) -> R<Value> {
++    ev.st_touch.set(ev.st_touch.get() + 1);
++    let l = loaded()?;
++    let lt = match &*l {
++        Ok(lt) => lt,
++        Err(m) => return eval_err(m.clone()),
++    };
++    let level = ev.stats.level.get();
++    let at = if level <= lt.states.len() as i64 { level } else { lt.lasso_target };
++    let cur = ev.cur.borrow().clone();
++    let names: Vec<StrId> = ev.var_names.borrow().iter().map(|n| str_id(&name_str(*n))).collect();
++    let vals: Vec<Value> = (0..names.len()).map(|i| cur.get(i)).collect();
++    Ok(Value::Tuple(TupleV::rc(vec![Value::Int(at), make_record(&names, vals)])))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn st(fields: &[(&str, Value)]) -> Vec<(String, Value)> {
++        fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
++    }
++
++    #[test]
++    fn formats() {
++        assert_eq!(dump_format("JSON").unwrap(), DumpFormat::Json);
++        assert_eq!(dump_format("json").unwrap(), DumpFormat::Json);
++        assert_eq!(dump_format("Tla").unwrap(), DumpFormat::Tla);
++        assert_eq!(dump_format("foo").unwrap_err(), "Error: Unknown format foo given to -dumpTrace.");
++        assert!(dump_format("tlc").unwrap_err().contains("not supported"));
++        assert!(load_format("json").is_ok());
++        assert!(load_format("TLC").unwrap_err().contains("not supported"));
++        assert_eq!(load_format("x").unwrap_err(), "Error: Unknown format x given to -loadTrace.");
++    }
++
++    fn int_set(lo: i64, hi: i64) -> Value {
++        Value::Set(Rc::new(SetV::new(SetK::Interval(lo, hi))))
++    }
++
++    /// Every kind of value, encoded as TLC's -dumpTrace json and tla encode it (the expected text is
++    /// what Java TLC wrote for the same values; see test/trace.test.ts for whole files).
++    #[test]
++    fn value_kinds() {
++        let ev = crate::eval::Evaluator::create();
++        let (a, b) = (Value::Model(model_value("a")), Value::Model(model_value("b")));
++        let s = |x: &str| Value::Str(str_id(x));
++        let t = |xs: Vec<Value>| Value::Tuple(TupleV::rc(xs));
++        let state = st(&[
++            ("i", Value::Int(-3)),
++            ("s", s("he\"llo\\\tx")),
++            ("b", Value::Bool(true)),
++            ("m", a.clone()),
++            ("q", t(vec![])),
++            ("tu", t(vec![Value::Int(1), s("a"), Value::Bool(false)])),
++            ("r", make_record(&[str_id("k"), str_id("l")], vec![Value::Int(1), s("q")])),
++            ("f0", make_fcn(&[Value::Int(0), Value::Int(1)], vec![Value::Int(5), Value::Int(6)])),
++            ("fm", make_fcn(&[a.clone(), b.clone()], vec![Value::Int(0), Value::Int(0)])),
++            ("ft", make_fcn(&[t(vec![Value::Int(1), Value::Int(2)])], vec![Value::Int(1)])),
++            ("se", SetV::of(vec![Value::Int(1), Value::Int(2)])),
++            ("es", SetV::of(vec![])),
++            ("iv", int_set(1, 3)),
++        ]);
++        let ce = CounterExample { states: vec![state], edges: vec![] };
++        // the names are listed in the order of TLC's sets of strings (first interned first), which in a
++        // test process depends on the other tests
++        let vars = format!("[{}]", ce.vars().iter().map(|v| format!("\"{}\"", v)).collect::<Vec<_>>().join(","));
++        let mut ids: Vec<StrId> = ce.states[0].iter().map(|(k, _)| str_id(k)).collect();
++        ids.sort_by_key(|i| i.0);
++        assert_eq!(ce.vars(), ids.iter().map(|i| str_of(*i).to_string()).collect::<Vec<_>>());
++        assert_eq!(
++            ce.to_json(ev).unwrap().replace(&vars, "VARS"),
++            "{\"counterexample\":{\"action\":[],\"state\":[[1,{\"i\":-3,\"s\":\"he\\\"llo\\\\\\tx\",\"b\":true,\"m\":\"a\",\"q\":[],\"tu\":[1,\"a\",false],\"r\":{\"k\":1,\"l\":\"q\"},\"f0\":{\"0\":5,\"1\":6},\"fm\":{\"a\":0,\"b\":0},\"ft\":{\"<<1, 2>>\":1},\"se\":[1,2],\"es\":[],\"iv\":[1,2,3]}]]},\"vars\":VARS}"
++        );
++        assert_eq!(
++            ce.to_tla("T.tla"),
++            "---- MODULE T ----\nLOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {}, state |-> {<<1, [i |-> -3, s |-> \"he\\\"llo\\\\\\tx\", b |-> TRUE, m |-> a, q |-> <<>>, tu |-> <<1, \"a\", FALSE>>, r |-> [k |-> 1, l |-> \"q\"], f0 |-> (0 :> 5 @@ 1 :> 6), fm |-> (a :> 0 @@ b :> 0), ft |-> (<<1, 2>> :> 1), se |-> {1, 2}, es |-> {}, iv |-> 1..3]>>}]\n\n===="
++        );
++    }
++
++    /// Edges: an action with parameters (TLC's context and parameters fields) and the edge that closes
++    /// a lasso.
++    #[test]
++    fn edges() {
++        let ev = crate::eval::Evaluator::create();
++        let x = |n: i64| st(&[("x", Value::Int(n))]);
++        let a = CeAction { name: "A".into(), loc: [6, 12, 6, 33], module: "M".into(), params: vec![("p".into(), Value::Model(model_value("p1"))), ("q".into(), Value::Int(1))] };
++        let ce = CounterExample { states: vec![x(0), x(1)], edges: vec![(0, a, 1), (1, CeAction::unnamed(), 1)] };
++        assert_eq!(
++            ce.to_json(ev).unwrap(),
++            "{\"counterexample\":{\"action\":[[[1,{\"x\":0}],{\"name\":\"A\",\"location\":{\"beginLine\":6,\"beginColumn\":12,\"endLine\":6,\"endColumn\":33,\"module\":\"M\"},\"context\":{\"p\":\"p1\",\"q\":1},\"parameters\":[\"p\",\"q\"]},[2,{\"x\":1}]],[[2,{\"x\":1}],{\"name\":\"UnnamedAction\",\"location\":{\"beginLine\":0,\"beginColumn\":0,\"endLine\":0,\"endColumn\":0,\"module\":\"--TLA+ BUILTINS--\"}},[2,{\"x\":1}]]],\"state\":[[1,{\"x\":0}],[2,{\"x\":1}]]},\"vars\":[\"x\"]}"
++        );
++        assert!(ce.to_tla("o").contains("[name |-> \"A\", location |-> [beginLine |-> 6, beginColumn |-> 12, endLine |-> 6, endColumn |-> 33, module |-> \"M\"], context |-> [p |-> p1, q |-> 1], parameters |-> <<\"p\", \"q\">>]"));
++        // a variable a simulation left unassigned cannot be encoded (TLC's Json override fails on null)
++        let un = CounterExample { states: vec![st(&[("x", Value::Undef)])], edges: vec![] };
++        assert!(un.to_json(ev).is_err());
++    }
++
++    /// The equality of -loadTrace: values of the state against values read from JSON, as TLC compares them.
++    #[test]
++    fn replay_equality() {
++        let _ = crate::eval::Evaluator::create();
++        let s = |x: &str| Value::Str(str_id(x));
++        let t = |xs: Vec<Value>| Value::Tuple(TupleV::rc(xs));
++        let rec = |ks: &[&str], vs: Vec<Value>| make_record(&ks.iter().map(|k| str_id(k)).collect::<Vec<_>>(), vs);
++        assert!(tlc_eq(&t(vec![Value::Int(1)]), &t(vec![Value::Int(1)])).unwrap());
++        assert!(!tlc_eq(&Value::Model(model_value("p1")), &s("p1")).unwrap());
++        // a set against the array JSON has for it
++        assert!(tlc_eq(&SetV::of(vec![Value::Int(1)]), &t(vec![Value::Int(1)])).is_err());
++        // a function of model values against an object: unequal domains
++        let fm = make_fcn(&[Value::Model(model_value("a"))], vec![Value::Int(0)]);
++        assert!(!tlc_eq(&fm, &rec(&["a"], vec![Value::Int(0)])).unwrap());
++        // a function with domain 0..1 against an object: an integer compared with a string
++        let f0 = make_fcn(&[Value::Int(0), Value::Int(1)], vec![Value::Int(0), Value::Int(0)]);
++        let e = tlc_eq(&f0, &rec(&["0", "1"], vec![Value::Int(0), Value::Int(0)])).unwrap_err();
++        assert!(matches!(&*e, Fail::Tla(t) if t.msg.starts_with("Attempted to compare an integer with non-integer:\n\"")));
++        // nested: records whose fields are compared the same way
++        assert!(tlc_eq(&rec(&["k"], vec![t(vec![s("x")])]), &rec(&["k"], vec![t(vec![s("x")])])).unwrap());
++        assert!(!tlc_eq(&rec(&["k"], vec![Value::Int(1)]), &rec(&["l"], vec![Value::Int(1)])).unwrap());
++    }
++
++    #[test]
++    fn tla_module_name() {
++        let ce = CounterExample { states: vec![st(&[("x", Value::Int(0))])], edges: vec![] };
++        assert_eq!(ce.to_tla("sub/x.tla.tla"), "---- MODULE sub/x.tla ----\nLOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {}, state |-> {<<1, [x |-> 0]>>}]\n\n====");
++        assert!(ce.to_tla("out").starts_with("---- MODULE out ----\n"));
++    }
++}
+diff --git a/src/value.rs b/src/value.rs
+index c280da7..af226b2 100644
+--- a/src/value.rs
++++ b/src/value.rs
+@@ -1225,7 +1225,7 @@ impl Hasher {
+ }
+ 
+ // ---- printing (TLC format) ----
+-fn fmt_str(s: &str, o: &mut String) {
++pub(crate) fn fmt_str(s: &str, o: &mut String) {
+     o.push('"');
+     for ch in s.chars() {
+         match ch {
+diff --git a/test/trace.test.ts b/test/trace.test.ts
+new file mode 100644
+index 0000000..19e80f4
+--- /dev/null
++++ b/test/trace.test.ts
+@@ -0,0 +1,223 @@
++// -dumpTrace and -loadTrace of the native binary. Every expected file below was written by Java TLC
++// (tla2tools.jar 2026.11.03, -workers 1, CommunityModules on the classpath) for the same spec and
++// configuration -- NOT by everystate. The JSON must be byte-identical; so must the module of
++// -dumpTrace tla (whose module name is the file name without its first ".tla").
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { spawnSync } from 'node:child_process';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++
++const bin = path.resolve(import.meta.dirname, '../target/release/everystate' + (process.platform === 'win32' ? '.exe' : ''));
++const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'everystate-trace-'));
++process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
++
++function run(args: string[]) {
++  const r = spawnSync(bin, args, { cwd: dir, encoding: 'utf8', timeout: 120_000 });
++  return { code: r.status, out: r.stdout + r.stderr };
++}
++const read = (f: string) => fs.readFileSync(path.join(dir, f), 'utf8');
++
++type Case = { name: string; tla: string; cfg: string; flags: string[]; json: string; module?: string; code: number };
++const CASES: Case[] = [
++ {
++  "name": "Init1",
++  "tla": "---- MODULE Init1 ----\nEXTENDS Integers\nVARIABLES x, y\nInit == x \\in {1, 2} /\\ y = \"a\"\nNext == x' = x + 1 /\\ y' = y\nInv == x > 1\n====\n",
++  "cfg": "INIT Init\nNEXT Next\nINVARIANT Inv\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[],\"state\":[[1,{\"x\":1,\"y\":\"a\"}]]},\"vars\":[\"x\",\"y\"]}",
++  "code": 12,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {}, state |-> {<<1, [x |-> 1, y |-> \"a\"]>>}]\n\n===="
++ },
++ {
++  "name": "Dead",
++  "tla": "---- MODULE Dead ----\nEXTENDS Integers\nVARIABLES x\nInit == x = 0\nNext == x < 2 /\\ x' = x + 1\n====\n",
++  "cfg": "INIT Init\nNEXT Next\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"x\":0}],{\"name\":\"Next\",\"location\":{\"beginLine\":5,\"beginColumn\":9,\"endLine\":5,\"endColumn\":27,\"module\":\"Dead\"}},[2,{\"x\":1}]],[[2,{\"x\":1}],{\"name\":\"Next\",\"location\":{\"beginLine\":5,\"beginColumn\":9,\"endLine\":5,\"endColumn\":27,\"module\":\"Dead\"}},[3,{\"x\":2}]]],\"state\":[[1,{\"x\":0}],[2,{\"x\":1}],[3,{\"x\":2}]]},\"vars\":[\"x\"]}",
++  "code": 11,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {<<<<1, [x |-> 0]>>, [name |-> \"Next\", location |-> [beginLine |-> 5, beginColumn |-> 9, endLine |-> 5, endColumn |-> 27, module |-> \"Dead\"]], <<2, [x |-> 1]>>>>, <<<<2, [x |-> 1]>>, [name |-> \"Next\", location |-> [beginLine |-> 5, beginColumn |-> 9, endLine |-> 5, endColumn |-> 27, module |-> \"Dead\"]], <<3, [x |-> 2]>>>>}, state |-> {<<1, [x |-> 0]>>, <<2, [x |-> 1]>>, <<3, [x |-> 2]>>}]\n\n===="
++ },
++ {
++  "name": "LiveBack",
++  "tla": "---- MODULE LiveBack ----\nEXTENDS Integers\nVARIABLES x\nInit == x = 0\nInc == x' = (x + 1) % 3\nSpec == Init /\\ [][Inc]_x /\\ WF_x(Inc)\nProp == <>(x = 5)\n====\n",
++  "cfg": "SPECIFICATION Spec\nPROPERTY Prop\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"x\":0}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":23,\"module\":\"LiveBack\"}},[2,{\"x\":1}]],[[2,{\"x\":1}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":23,\"module\":\"LiveBack\"}},[3,{\"x\":2}]],[[3,{\"x\":2}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":23,\"module\":\"LiveBack\"}},[1,{\"x\":0}]]],\"state\":[[1,{\"x\":0}],[2,{\"x\":1}],[3,{\"x\":2}]]},\"vars\":[\"x\"]}",
++  "code": 13,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {<<<<1, [x |-> 0]>>, [name |-> \"Inc\", location |-> [beginLine |-> 5, beginColumn |-> 8, endLine |-> 5, endColumn |-> 23, module |-> \"LiveBack\"]], <<2, [x |-> 1]>>>>, <<<<2, [x |-> 1]>>, [name |-> \"Inc\", location |-> [beginLine |-> 5, beginColumn |-> 8, endLine |-> 5, endColumn |-> 23, module |-> \"LiveBack\"]], <<3, [x |-> 2]>>>>, <<<<3, [x |-> 2]>>, [name |-> \"Inc\", location |-> [beginLine |-> 5, beginColumn |-> 8, endLine |-> 5, endColumn |-> 23, module |-> \"LiveBack\"]], <<1, [x |-> 0]>>>>}, state |-> {<<1, [x |-> 0]>>, <<2, [x |-> 1]>>, <<3, [x |-> 2]>>}]\n\n===="
++ },
++ {
++  "name": "LiveStut",
++  "tla": "---- MODULE LiveStut ----\nEXTENDS Integers\nVARIABLES x\nInit == x = 0\nInc == x < 2 /\\ x' = x + 1\nSpec == Init /\\ [][Inc]_x\nProp == <>(x = 5)\n====\n",
++  "cfg": "SPECIFICATION Spec\nPROPERTY Prop\n",
++  "flags": [
++   "-deadlock"
++  ],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"x\":0}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":26,\"module\":\"LiveStut\"}},[2,{\"x\":1}]],[[2,{\"x\":1}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":26,\"module\":\"LiveStut\"}},[3,{\"x\":2}]],[[3,{\"x\":2}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":26,\"module\":\"LiveStut\"}},[3,{\"x\":2}]]],\"state\":[[1,{\"x\":0}],[2,{\"x\":1}],[3,{\"x\":2}]]},\"vars\":[\"x\"]}",
++  "code": 13,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {<<<<1, [x |-> 0]>>, [name |-> \"Inc\", location |-> [beginLine |-> 5, beginColumn |-> 8, endLine |-> 5, endColumn |-> 26, module |-> \"LiveStut\"]], <<2, [x |-> 1]>>>>, <<<<2, [x |-> 1]>>, [name |-> \"Inc\", location |-> [beginLine |-> 5, beginColumn |-> 8, endLine |-> 5, endColumn |-> 26, module |-> \"LiveStut\"]], <<3, [x |-> 2]>>>>, <<<<3, [x |-> 2]>>, [name |-> \"Inc\", location |-> [beginLine |-> 5, beginColumn |-> 8, endLine |-> 5, endColumn |-> 26, module |-> \"LiveStut\"]], <<3, [x |-> 2]>>>>}, state |-> {<<1, [x |-> 0]>>, <<2, [x |-> 1]>>, <<3, [x |-> 2]>>}]\n\n===="
++ },
++ {
++  "name": "LiveInit",
++  "tla": "---- MODULE LiveInit ----\nEXTENDS Integers\nVARIABLES x\nInit == x = 0\nInc == x > 10 /\\ x' = x + 1\nSpec == Init /\\ [][Inc]_x\nProp == <>(x = 5)\n====\n",
++  "cfg": "SPECIFICATION Spec\nPROPERTY Prop\n",
++  "flags": [
++   "-deadlock"
++  ],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"x\":0}],{\"name\":\"UnnamedAction\",\"location\":{\"beginLine\":0,\"beginColumn\":0,\"endLine\":0,\"endColumn\":0,\"module\":\"--TLA+ BUILTINS--\"}},[1,{\"x\":0}]]],\"state\":[[1,{\"x\":0}]]},\"vars\":[\"x\"]}",
++  "code": 13,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {<<<<1, [x |-> 0]>>, [name |-> \"UnnamedAction\", location |-> [beginLine |-> 0, beginColumn |-> 0, endLine |-> 0, endColumn |-> 0, module |-> \"--TLA+ BUILTINS--\"]], <<1, [x |-> 0]>>>>}, state |-> {<<1, [x |-> 0]>>}]\n\n===="
++ },
++ {
++  "name": "ActProp",
++  "tla": "---- MODULE ActProp ----\nEXTENDS Integers\nVARIABLES x\nInit == x = 0\nNext == x' = x + 1\nSpec == Init /\\ [][Next]_x\nAP == [][x' < 2]_x\n====\n",
++  "cfg": "SPECIFICATION Spec\nPROPERTY AP\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"x\":0}],{\"name\":\"Next\",\"location\":{\"beginLine\":5,\"beginColumn\":9,\"endLine\":5,\"endColumn\":18,\"module\":\"ActProp\"}},[2,{\"x\":1}]],[[2,{\"x\":1}],{\"name\":\"Next\",\"location\":{\"beginLine\":5,\"beginColumn\":9,\"endLine\":5,\"endColumn\":18,\"module\":\"ActProp\"}},[3,{\"x\":2}]]],\"state\":[[1,{\"x\":0}],[2,{\"x\":1}],[3,{\"x\":2}]]},\"vars\":[\"x\"]}",
++  "code": 13,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {<<<<1, [x |-> 0]>>, [name |-> \"Next\", location |-> [beginLine |-> 5, beginColumn |-> 9, endLine |-> 5, endColumn |-> 18, module |-> \"ActProp\"]], <<2, [x |-> 1]>>>>, <<<<2, [x |-> 1]>>, [name |-> \"Next\", location |-> [beginLine |-> 5, beginColumn |-> 9, endLine |-> 5, endColumn |-> 18, module |-> \"ActProp\"]], <<3, [x |-> 2]>>>>}, state |-> {<<1, [x |-> 0]>>, <<2, [x |-> 1]>>, <<3, [x |-> 2]>>}]\n\n===="
++ },
++ {
++  "name": "Param",
++  "tla": "---- MODULE Param ----\nEXTENDS Integers\nCONSTANTS P\nVARIABLES x, who\nInit == x = 0 /\\ who = \"none\"\nA(p, q) == x' = x + q /\\ who' = p\nB == x' = x * 2 /\\ who' = who\nNext == (\\E p \\in P, q \\in 1..2 : A(p, q)) \\/ B\nInv == x < 3\n====\n",
++  "cfg": "CONSTANTS P = {p1, p2}\nINIT Init\nNEXT Next\nINVARIANT Inv\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"who\":\"none\",\"x\":0}],{\"name\":\"A\",\"location\":{\"beginLine\":6,\"beginColumn\":12,\"endLine\":6,\"endColumn\":33,\"module\":\"Param\"},\"context\":{\"p\":\"p1\",\"q\":1},\"parameters\":[\"p\",\"q\"]},[2,{\"who\":\"p1\",\"x\":1}]],[[2,{\"who\":\"p1\",\"x\":1}],{\"name\":\"A\",\"location\":{\"beginLine\":6,\"beginColumn\":12,\"endLine\":6,\"endColumn\":33,\"module\":\"Param\"},\"context\":{\"p\":\"p1\",\"q\":2},\"parameters\":[\"p\",\"q\"]},[3,{\"who\":\"p1\",\"x\":3}]]],\"state\":[[1,{\"who\":\"none\",\"x\":0}],[2,{\"who\":\"p1\",\"x\":1}],[3,{\"who\":\"p1\",\"x\":3}]]},\"vars\":[\"x\",\"who\"]}",
++  "code": 12,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {<<<<1, [who |-> \"none\", x |-> 0]>>, [name |-> \"A\", location |-> [beginLine |-> 6, beginColumn |-> 12, endLine |-> 6, endColumn |-> 33, module |-> \"Param\"], context |-> [p |-> p1, q |-> 1], parameters |-> <<\"p\", \"q\">>], <<2, [who |-> p1, x |-> 1]>>>>, <<<<2, [who |-> p1, x |-> 1]>>, [name |-> \"A\", location |-> [beginLine |-> 6, beginColumn |-> 12, endLine |-> 6, endColumn |-> 33, module |-> \"Param\"], context |-> [p |-> p1, q |-> 2], parameters |-> <<\"p\", \"q\">>], <<3, [who |-> p1, x |-> 3]>>>>}, state |-> {<<1, [who |-> \"none\", x |-> 0]>>, <<2, [who |-> p1, x |-> 1]>>, <<3, [who |-> p1, x |-> 3]>>}]\n\n===="
++ },
++ {
++  "name": "Alias",
++  "tla": "---- MODULE Alias ----\nEXTENDS Integers\nVARIABLES x, y\nInit == x = 0 /\\ y = 10\nNext == x' = x + 1 /\\ y' = y - 1\nInv == x < 2\nAl == [sum |-> x + y, xx |-> x, nx |-> x']\n====\n",
++  "cfg": "INIT Init\nNEXT Next\nINVARIANT Inv\nALIAS Al\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"sum\":10,\"xx\":0,\"nx\":1}],{\"name\":\"Next\",\"location\":{\"beginLine\":5,\"beginColumn\":9,\"endLine\":5,\"endColumn\":32,\"module\":\"Alias\"}},[2,{\"sum\":10,\"xx\":1,\"nx\":2}]],[[2,{\"sum\":10,\"xx\":1,\"nx\":2}],{\"name\":\"Next\",\"location\":{\"beginLine\":5,\"beginColumn\":9,\"endLine\":5,\"endColumn\":32,\"module\":\"Alias\"}},[3,{\"sum\":10,\"xx\":2,\"nx\":2}]]],\"state\":[[1,{\"sum\":10,\"xx\":0,\"nx\":1}],[2,{\"sum\":10,\"xx\":1,\"nx\":2}],[3,{\"sum\":10,\"xx\":2,\"nx\":2}]]},\"vars\":[\"sum\",\"xx\",\"nx\"]}",
++  "code": 12,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {<<<<1, [sum |-> 10, xx |-> 0, nx |-> 1]>>, [name |-> \"Next\", location |-> [beginLine |-> 5, beginColumn |-> 9, endLine |-> 5, endColumn |-> 32, module |-> \"Alias\"]], <<2, [sum |-> 10, xx |-> 1, nx |-> 2]>>>>, <<<<2, [sum |-> 10, xx |-> 1, nx |-> 2]>>, [name |-> \"Next\", location |-> [beginLine |-> 5, beginColumn |-> 9, endLine |-> 5, endColumn |-> 32, module |-> \"Alias\"]], <<3, [sum |-> 10, xx |-> 2, nx |-> 2]>>>>}, state |-> {<<1, [sum |-> 10, xx |-> 0, nx |-> 1]>>, <<2, [sum |-> 10, xx |-> 1, nx |-> 2]>>, <<3, [sum |-> 10, xx |-> 2, nx |-> 2]>>}]\n\n===="
++ },
++ {
++  "name": "LiveAl",
++  "tla": "---- MODULE LiveAl ----\nEXTENDS Integers\nVARIABLES x, y\nInit == x = 0 /\\ y = 0\nInc == x' = (x + 1) % 3 /\\ y' = y\nSpec == Init /\\ [][Inc]_<<x, y>> /\\ WF_<<x, y>>(Inc)\nProp == <>(x = 5)\nInv == x < 2\nAl == [y |-> y, x |-> x, nx |-> x']\n====\n",
++  "cfg": "SPECIFICATION Spec\nPROPERTY Prop\nALIAS Al\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"x\":0,\"y\":0}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":33,\"module\":\"LiveAl\"}},[2,{\"x\":1,\"y\":0}]],[[2,{\"x\":1,\"y\":0}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":33,\"module\":\"LiveAl\"}},[3,{\"x\":2,\"y\":0}]],[[3,{\"x\":2,\"y\":0}],{\"name\":\"Inc\",\"location\":{\"beginLine\":5,\"beginColumn\":8,\"endLine\":5,\"endColumn\":33,\"module\":\"LiveAl\"}},[1,{\"x\":0,\"y\":0}]]],\"state\":[[1,{\"x\":0,\"y\":0}],[2,{\"x\":1,\"y\":0}],[3,{\"x\":2,\"y\":0}]]},\"vars\":[\"x\",\"y\"]}",
++  "code": 13
++ },
++ {
++  "name": "Fn",
++  "tla": "---- MODULE Fn ----\nEXTENDS Integers, Sequences, FiniteSets\nCONSTANTS a, b\nVARIABLES f0, fm, ft, sr, es, iv, ss, nest, strs, fz, recs, tab\nInit == /\\ f0 = [i \\in 0..2 |-> i]\n        /\\ fm = [s \\in {a, b} |-> 0]\n        /\\ ft = [p \\in {<<1, 2>>, <<3, 4>>} |-> p[1]]\n        /\\ sr = {[k |-> 1], [k |-> 2]}\n        /\\ es = {}\n        /\\ iv = 1..3\n        /\\ ss = SUBSET {1, 2}\n        /\\ nest = <<{<<>>}, [u |-> {a}], <<<<1>>>>>>\n        /\\ strs = {\"zz\", \"b\", \"aa\"}\n        /\\ fz = [i \\in 2..3 |-> TRUE]\n        /\\ recs = [k : {1, 2}, l : {\"q\"}]\n        /\\ tab = \"a\\tb\\nc\"\nNext == UNCHANGED <<f0, fm, ft, sr, es, iv, ss, nest, strs, fz, recs, tab>>\nInv == f0 = <<>>\n====\n",
++  "cfg": "CONSTANTS a = a b = b\nINIT Init\nNEXT Next\nINVARIANT Inv\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[],\"state\":[[1,{\"fm\":{\"a\":0,\"b\":0},\"ft\":{\"<<1, 2>>\":1,\"<<3, 4>>\":3},\"fz\":{\"2\":true,\"3\":true},\"sr\":[{\"k\":1},{\"k\":2}],\"ss\":[[],[1],[2],[1,2]],\"nest\":[[[]],{\"u\":[\"a\"]},[[1]]],\"iv\":[1,2,3],\"strs\":[\"b\",\"zz\",\"aa\"],\"f0\":{\"0\":0,\"1\":1,\"2\":2},\"recs\":[{\"k\":1,\"l\":\"q\"},{\"k\":2,\"l\":\"q\"}],\"tab\":\"a\\tb\\nc\",\"es\":[]}]]},\"vars\":[\"f0\",\"fm\",\"ft\",\"sr\",\"es\",\"iv\",\"ss\",\"nest\",\"strs\",\"fz\",\"recs\",\"tab\"]}",
++  "code": 12
++ },
++ {
++  "name": "V",
++  "tla": "---- MODULE V ----\nEXTENDS Integers, Sequences, FiniteSets, TLC\nCONSTANTS a, b\nVARIABLES x, s, r, f, q, t, m, str, bl, neg\nInit == /\\ x = 0 /\\ s = {1,2} /\\ r = [p |-> 1, q |-> \"z\"] /\\ f = [i \\in {1,2} |-> i * 2]\n        /\\ q = <<>> /\\ t = <<1, \"a\", TRUE>> /\\ m = a /\\ str = \"he\\\"llo\\\\\" /\\ bl = FALSE /\\ neg = -3\nNext == /\\ x' = x + 1 /\\ s' = s \\cup {x} /\\ r' = r /\\ f' = [f EXCEPT ![1] = 7]\n        /\\ q' = Append(q, x) /\\ t' = t /\\ m' = b /\\ str' = str /\\ bl' = ~bl /\\ neg' = neg\nInv == x < 2\n====\n",
++  "cfg": "CONSTANTS a = a b = b\nINIT Init\nNEXT Next\nINVARIANT Inv\n",
++  "flags": [],
++  "json": "{\"counterexample\":{\"action\":[[[1,{\"str\":\"he\\\"llo\\\\\",\"neg\":-3,\"bl\":false,\"f\":[2,4],\"m\":\"a\",\"q\":[],\"r\":{\"q\":\"z\",\"p\":1},\"s\":[1,2],\"t\":[1,\"a\",true],\"x\":0}],{\"name\":\"Next\",\"location\":{\"beginLine\":7,\"beginColumn\":9,\"endLine\":8,\"endColumn\":89,\"module\":\"V\"}},[2,{\"str\":\"he\\\"llo\\\\\",\"neg\":-3,\"bl\":true,\"f\":[7,4],\"m\":\"b\",\"q\":[0],\"r\":{\"q\":\"z\",\"p\":1},\"s\":[0,1,2],\"t\":[1,\"a\",true],\"x\":1}]],[[2,{\"str\":\"he\\\"llo\\\\\",\"neg\":-3,\"bl\":true,\"f\":[7,4],\"m\":\"b\",\"q\":[0],\"r\":{\"q\":\"z\",\"p\":1},\"s\":[0,1,2],\"t\":[1,\"a\",true],\"x\":1}],{\"name\":\"Next\",\"location\":{\"beginLine\":7,\"beginColumn\":9,\"endLine\":8,\"endColumn\":89,\"module\":\"V\"}},[3,{\"str\":\"he\\\"llo\\\\\",\"neg\":-3,\"bl\":false,\"f\":[7,4],\"m\":\"b\",\"q\":[0,1],\"r\":{\"q\":\"z\",\"p\":1},\"s\":[0,1,2],\"t\":[1,\"a\",true],\"x\":2}]]],\"state\":[[1,{\"str\":\"he\\\"llo\\\\\",\"neg\":-3,\"bl\":false,\"f\":[2,4],\"m\":\"a\",\"q\":[],\"r\":{\"q\":\"z\",\"p\":1},\"s\":[1,2],\"t\":[1,\"a\",true],\"x\":0}],[2,{\"str\":\"he\\\"llo\\\\\",\"neg\":-3,\"bl\":true,\"f\":[7,4],\"m\":\"b\",\"q\":[0],\"r\":{\"q\":\"z\",\"p\":1},\"s\":[0,1,2],\"t\":[1,\"a\",true],\"x\":1}],[3,{\"str\":\"he\\\"llo\\\\\",\"neg\":-3,\"bl\":false,\"f\":[7,4],\"m\":\"b\",\"q\":[0,1],\"r\":{\"q\":\"z\",\"p\":1},\"s\":[0,1,2],\"t\":[1,\"a\",true],\"x\":2}]]},\"vars\":[\"x\",\"s\",\"r\",\"f\",\"q\",\"t\",\"m\",\"str\",\"bl\",\"neg\"]}",
++  "code": 12,
++  "module": "LOCAL INSTANCE TLC\n\nCounterExample == \n\t[action |-> {<<<<1, [str |-> \"he\\\"llo\\\\\", neg |-> -3, bl |-> FALSE, f |-> <<2, 4>>, m |-> a, q |-> <<>>, r |-> [q |-> \"z\", p |-> 1], s |-> {1, 2}, t |-> <<1, \"a\", TRUE>>, x |-> 0]>>, [name |-> \"Next\", location |-> [beginLine |-> 7, beginColumn |-> 9, endLine |-> 8, endColumn |-> 89, module |-> \"V\"]], <<2, [str |-> \"he\\\"llo\\\\\", neg |-> -3, bl |-> TRUE, f |-> <<7, 4>>, m |-> b, q |-> <<0>>, r |-> [q |-> \"z\", p |-> 1], s |-> {0, 1, 2}, t |-> <<1, \"a\", TRUE>>, x |-> 1]>>>>, <<<<2, [str |-> \"he\\\"llo\\\\\", neg |-> -3, bl |-> TRUE, f |-> <<7, 4>>, m |-> b, q |-> <<0>>, r |-> [q |-> \"z\", p |-> 1], s |-> {0, 1, 2}, t |-> <<1, \"a\", TRUE>>, x |-> 1]>>, [name |-> \"Next\", location |-> [beginLine |-> 7, beginColumn |-> 9, endLine |-> 8, endColumn |-> 89, module |-> \"V\"]], <<3, [str |-> \"he\\\"llo\\\\\", neg |-> -3, bl |-> FALSE, f |-> <<7, 4>>, m |-> b, q |-> <<0, 1>>, r |-> [q |-> \"z\", p |-> 1], s |-> {0, 1, 2}, t |-> <<1, \"a\", TRUE>>, x |-> 2]>>>>}, state |-> {<<1, [str |-> \"he\\\"llo\\\\\", neg |-> -3, bl |-> FALSE, f |-> <<2, 4>>, m |-> a, q |-> <<>>, r |-> [q |-> \"z\", p |-> 1], s |-> {1, 2}, t |-> <<1, \"a\", TRUE>>, x |-> 0]>>, <<2, [str |-> \"he\\\"llo\\\\\", neg |-> -3, bl |-> TRUE, f |-> <<7, 4>>, m |-> b, q |-> <<0>>, r |-> [q |-> \"z\", p |-> 1], s |-> {0, 1, 2}, t |-> <<1, \"a\", TRUE>>, x |-> 1]>>, <<3, [str |-> \"he\\\"llo\\\\\", neg |-> -3, bl |-> FALSE, f |-> <<7, 4>>, m |-> b, q |-> <<0, 1>>, r |-> [q |-> \"z\", p |-> 1], s |-> {0, 1, 2}, t |-> <<1, \"a\", TRUE>>, x |-> 2]>>}]\n\n===="
++ }
++];
++
++for (const c of CASES) {
++  test(`-dumpTrace json and tla: ${c.name} (as TLC)`, () => {
++    fs.writeFileSync(path.join(dir, c.name + '.tla'), c.tla);
++    fs.writeFileSync(path.join(dir, c.name + '.cfg'), c.cfg);
++    const r = run(['-workers', '1', ...c.flags, '-dumpTrace', 'json', c.name + '.json', '-dumptrace', 'TLA', c.name + '_ce.tla', c.name + '.tla']);
++    assert.equal(r.code, c.code, r.out);
++    assert.equal(read(c.name + '.json'), c.json);
++    assert.ok(r.out.includes(`"CounterExample written: ${c.name}.json"\n"CounterExample written: ${c.name}_ce.tla"\n`), r.out);
++    if (c.module !== undefined) assert.equal(read(c.name + '_ce.tla'), `---- MODULE ${c.name}_ce ----\n` + c.module);
++  });
++}
++
++test('the line is printed after the trace and before the statistics, unframed with -tool', () => {
++  let r = run(['-workers', '1', '-dumpTrace', 'json', 'd1.json', 'Dead.tla']);
++  assert.match(r.out, /x = 2\n\n"CounterExample written: d1.json"\n3 states generated/);
++  r = run(['-workers', '1', 'LiveBack.tla', '-dumpTrace', 'json', 'l1.json']);
++  assert.match(r.out, /Back to state 1: <Inc line 5, col 8 to line 5, col 23 of module LiveBack>\n\n"CounterExample written: l1.json"\nFinished checking temporal properties/);
++  r = run(['-workers', '1', '-tool', '-dumpTrace', 'json', 'd2.json', 'Dead.tla']);
++  assert.match(r.out, /@!@!@ENDMSG 2217 @!@!@\n"CounterExample written: d2.json"\n@!@!@STARTMSG/);
++  // simulation: after its statistics
++  r = run(['-simulate', '-seed', '1', '-dumpTrace', 'json', 's1.json', 'Dead.tla']);
++  assert.match(r.out, /Simulation using seed 1 and aril 0\n"CounterExample written: s1.json"\n/);
++  assert.equal(read('s1.json'), CASES.find(c => c.name === 'Dead')!.json);
++  // -json: the file is written, the single JSON line stays alone
++  r = run(['-json', '-dumpTrace', 'json', 'j1.json', 'Dead.tla']);
++  assert.equal(JSON.parse(r.out.trim()).status, 'deadlock');
++  assert.equal(read('j1.json'), CASES.find(c => c.name === 'Dead')!.json);
++});
++
++test('no counterexample, no file (and evaluation errors of model checking have none, as in TLC)', () => {
++  fs.writeFileSync(path.join(dir, 'Ok.tla'), '---- MODULE Ok ----\nVARIABLE x\nInit == x = 0\nNext == x\' = x\n====\n');
++  fs.writeFileSync(path.join(dir, 'Ok.cfg'), 'INIT Init\nNEXT Next\n');
++  let r = run(['-dumpTrace', 'json', 'ok.json', 'Ok.tla']);
++  assert.equal(r.code, 0, r.out);
++  assert.ok(!fs.existsSync(path.join(dir, 'ok.json')));
++  fs.writeFileSync(path.join(dir, 'Err.tla'), '---- MODULE Err ----\nEXTENDS Integers\nVARIABLE x\nInit == x = 0\nNext == x\' = x + 1\nInv == IF x < 2 THEN TRUE ELSE x = "a"\n====\n');
++  fs.writeFileSync(path.join(dir, 'Err.cfg'), 'INIT Init\nNEXT Next\nINVARIANT Inv\n');
++  r = run(['-dumpTrace', 'json', 'err.json', 'Err.tla']);
++  assert.equal(r.code, 76, r.out);
++  assert.ok(!fs.existsSync(path.join(dir, 'err.json')));
++  // ... but the simulator hands TLC's postconditions the behaviour of any error
++  r = run(['-simulate', '-seed', '1', '-dumpTrace', 'json', 'err2.json', 'Err.tla']);
++  assert.equal(r.code, 76, r.out);
++  assert.equal(JSON.parse(read('err2.json')).counterexample.state.length, 3);
++});
++
++test('options: TLC\'s errors for a missing or unknown format, clear errors for formats not written', () => {
++  let r = run(['-dumpTrace', 'foo', 'x.json', 'Dead.tla']);
++  assert.equal(r.code, 1);
++  assert.equal(r.out, 'Error: Error: Unknown format foo given to -dumpTrace.\n');
++  r = run(['-loadTrace', 'foo', 'x.json', 'Dead.tla']);
++  assert.equal(r.out, 'Error: Error: Unknown format foo given to -loadTrace.\n');
++  r = run(['Dead.tla', '-dumpTrace', 'json']);
++  assert.equal(r.out, 'Error: Error: A format and a file name for dumping traces required.\n');
++  r = run(['-dumpTrace', 'tlc', 'x.bin', 'Dead.tla']);
++  assert.equal(r.code, 1);
++  assert.match(r.out, /-dumpTrace tlc .* is not supported by everystate/);
++  r = run(['-loadTrace', 'tlc', 'x.bin', 'Dead.tla']);
++  assert.equal(r.code, 1);
++  assert.match(r.out, /-loadTrace tlc is not supported by everystate/);
++});
++
++test('-loadTrace json replays a dumped trace as TLC does', () => {
++  // the counterexample comes back unchanged, for safety and liveness traces (back to a state, stuttering)
++  for (const name of ['Dead', 'LiveBack', 'LiveStut', 'ActProp', 'Init1', 'LiveAl']) {
++    const c = CASES.find(c => c.name === name)!;
++    fs.writeFileSync(path.join(dir, 'in_' + name + '.json'), c.json);
++    const r = run(['-workers', '1', ...c.flags, '-config', name + '.cfg', '-loadTrace', 'json', 'in_' + name + '.json', '-dumpTrace', 'json', 'out_' + name + '.json', name + '.tla']);
++    assert.equal(r.code, c.code, r.out);
++    assert.equal(read('out_' + name + '.json'), c.json, name);
++  }
++  // TLC, the same: the replay is restricted to the trace (3 states, not the 4 of the spec)
++  let r = run(['-workers', '1', '-loadTrace', 'json', 'in_LiveBack.json', 'LiveBack.tla']);
++  assert.match(r.out, /4 states generated, 3 distinct states found, 0 states left on queue./);
++  // a model value never equals the string the JSON file has for it: nothing matches after the initial state
++  fs.writeFileSync(path.join(dir, 'in_Param.json'), CASES.find(c => c.name === 'Param')!.json);
++  r = run(['-workers', '1', '-loadTrace', 'json', 'in_Param.json', '-dumpTrace', 'json', 'out_Param.json', 'Param.tla']);
++  assert.equal(r.code, 0, r.out);
++  assert.match(r.out, /6 states generated, 1 distinct states found, 0 states left on queue./);
++  assert.ok(!fs.existsSync(path.join(dir, 'out_Param.json')));
++  // a set in the state against the array of the file: TLC's equality error
++  fs.writeFileSync(path.join(dir, 'in_V.json'), CASES.find(c => c.name === 'V')!.json);
++  r = run(['-workers', '1', '-loadTrace', 'json', 'in_V.json', 'V.tla']);
++  assert.match(r.out, /Error: Attempted to check equality of the set \{1, 2\} with the tuple <<1, 2>>\nWhile working on the initial state:/);
++  // a function with domain 0..2 against a JSON object: TLC's comparison error
++  fs.writeFileSync(path.join(dir, 'in_Fn.json'), CASES.find(c => c.name === 'Fn')!.json);
++  r = run(['-workers', '1', '-loadTrace', 'json', 'in_Fn.json', 'Fn.tla']);
++  assert.match(r.out, /Error: Attempted to compare an integer with non-integer:\n"\d"\.\nWhile working on the initial state:/);
++  // a missing file
++  r = run(['-loadTrace', 'json', 'nonexistent.json', 'Dead.tla']);
++  assert.match(r.out, /Error: Attempted to apply the operator overridden by the Java method\npublic static tlc2.value.IValue tlc2.overrides.Json.deserialize\(tlc2.value.impl.StringValue\) throws java.io.IOException,\nbut it produced the following error:\nnonexistent.json \(No such file or directory\)/);
++  // with workers, the same
++  r = run(['-workers', '4', '-loadTrace', 'json', 'in_LiveBack.json', '-dumpTrace', 'json', 'out_w.json', 'LiveBack.tla']);
++  assert.equal(r.code, 13, r.out);
++  assert.equal(read('out_w.json'), CASES.find(c => c.name === 'LiveBack')!.json);
++});
++

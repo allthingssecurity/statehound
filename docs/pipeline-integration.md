@@ -24,11 +24,12 @@ back to Java TLC for a run.
 | `scripts/tlc/run_model_check.sh` (every model-checking run of the agents) | `java ... tlc2.TLC`, requires `lib/tla2tools.jar` | `bin/statehound` when installed; the jar is required only when Statehound is absent or `STATEHOUND=off` |
 | `scripts/tlc/validate.sh` (trace validation) | Java TLC; downloads the jars | `everystate` when installed; no download |
 | trace debugger tool: trace validation | Java TLC | `everystate` when installed |
+| invariant-checking tool: trace replay (`-loadTrace json`, `-dumpTrace json`) | Java TLC | `everystate` when installed |
 | `scripts/infra/setup.sh` | requires Java, downloads jars, builds the Java CFA tool | skips the jars when `bin/statehound` and `bin/everystate` exist, and the CFA build when `bin/tla-cfa` exists |
 
-Three more tools (trace replay, the debugger launch, the coverage script) switch to everystate in the
-same commit that adds the everystate feature each one needs (see the status table below); until then they
-keep using Java TLC.
+Two more tools (the debugger launch and the coverage script) switch to everystate in the same commit
+that adds the everystate feature each one needs (see the status table below); until then they keep using
+Java TLC.
 | `tools/inv_checking_tool/src/trace_reader.py` | `eval()` on text from TLC output; a dynamic import | `ast.literal_eval` (same result on all 99,166 labels of a real TLC state-graph dump, never executes code); the user handler plugin moved to its own module |
 | `src/specular/native_compaction.py` | `importlib.import_module("copilot")` | a plain lazy import (same behaviour) |
 
@@ -55,7 +56,7 @@ is safe on machines without Statehound.
 | Feature | Used by | Status |
 |---|---|---|
 | model checking, simulation, liveness | every phase | Rust (everystate) |
-| `-dumpTrace json\|tla`, `-loadTrace` | trace replay, `-j` | in progress in everystate |
+| `-dumpTrace json\|tla`, `-loadTrace json` | trace replay, `-j` | Rust (everystate patch 0002): 46 of 72 corpus dumps byte-identical to TLC's, the rest differ only in variable order or (liveness) in the lasso chosen; the replay tool's output on a sample trace is byte-identical to TLC's. TLC's binary `tlc` format is not supported. Like TLC, a JSON trace with model values does not replay (TLC writes them as strings) |
 | `-continue` | `-C` | in progress in everystate |
 | `-coverage` | coverage script | in progress in everystate |
 | `-debugger` (DAP) | trace debugger tool | in progress in everystate |

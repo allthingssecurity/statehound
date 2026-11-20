@@ -141,17 +141,20 @@ without Java, see [docs/pipeline-integration.md](docs/pipeline-integration.md).
 ## Status
 
 Done and measured: the `statehound` portfolio, `everystate -hunt`, `statehound scan` / `audit`, the
-skill, the pipeline integration for model checking. In progress, landing as separate commits as each is
-verified against Java TLC: `-dumpTrace`/`-loadTrace`, `-continue`, `-coverage`, `-debugger` (DAP), a
-SANY-equivalent parse check, the Rust port of the CFA `vav` tool, and diagram-equivalence pruning for the
-hunters. Until an option lands, `statehound` refuses it with a clear message.
+skill, the pipeline integration for model checking, `-dumpTrace json|tla` / `-loadTrace json` (with the
+pipeline's trace replay). In progress, landing as separate commits as each is verified against Java TLC:
+`-continue`, `-coverage`, `-debugger` (DAP), a SANY-equivalent parse check, and the Rust port of the CFA
+`vav` tool. Until an option lands, `statehound` refuses it with a clear message.
+
+Measured and not adopted: diagram-equivalence (partial-order) pruning in the hunters. Over 840 runs it found
+nothing extra and was about 7% slower; see [docs/guided-hunting.md](docs/guided-hunting.md).
 
 ## Repository layout
 
 | Path | What |
 |---|---|
 | `crates/statehound/` | the `statehound` binary (portfolio, cache, process supervision) |
-| `patches/everystate/` | the everystate patch: `-hunt` (guided hunting) and supervision support |
+| `patches/everystate/` | the everystate patch series: `0001` `-hunt` (guided hunting) and supervision support, `0002` `-dumpTrace` / `-loadTrace` |
 | `patches/pipeline/` | patches that make the bug-finding pipeline use Statehound instead of Java |
 | `skills/statehound/` | the agent skill |
 | `examples/lost-update/` | the runnable example used throughout the docs |

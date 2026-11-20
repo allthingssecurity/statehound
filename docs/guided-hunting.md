@@ -94,8 +94,26 @@ and they all reach the same states.
 Applied to the hunters, this means: at each state, when two enabled actions commute, explore only one
 of their two orders. Because a hunter only ever reports violations it actually reached (and replays them),
 such pruning can make a hunt faster or slower at finding bugs but never makes a verdict wrong; the
-exhaustive search is not touched. This is being implemented and benchmarked (`-hunt por=on`, sleep sets
-with an exact per-state commutativity check); it will be enabled by default only if it measurably helps.
+exhaustive search is not touched.
+
+**Measured result: it does not help on real specs, so it is not part of Statehound.** Sleep sets with an
+exact "diamond" commutativity test per state (and a learned variant, plus ample sets as an experiment) were
+run on the 70 violating corpus jobs, 3 seeds each, with the replay self-check on:
+
+| Variant | Found | Time vs no pruning (geometric mean) | States archived vs no pruning |
+|---|---:|---:|---:|
+| none | 207 / 210 | 1.00 | 1.00 |
+| sleep sets, learned independence | 207 / 210 | 1.07 | 0.85 |
+| sleep sets, exact test every time | 207 / 210 | 1.26 | 0.72 |
+| ample sets (one step lookahead) | 180 / 210 | 1.19 | 0.63 |
+
+Same bugs found, slower, and ample sets lose bugs. The reason is structural: deciding that two actions
+commute at a state requires computing both orders, which is exactly the work the pruning is meant to save,
+and these specs have few commuting pairs (only 85 action pairs were ever found independent; most of the
+~29 actions evaluated per expansion are disabled guards, which no sleep set can skip). On a synthetic spec
+made of independent counters the same code cut the states needed to reach the violation from 8,234 to
+1,866, so the mechanism works where independence dominates. A real gain would need a cheap static source
+of independence (read/write footprints per action), which the evaluator the hunter uses does not provide.
 
 ## The portfolio
 

@@ -22,6 +22,9 @@ pub struct Invocation {
     pub writes_files: bool,
     /// Set when some argument is a TLC option that everystate does not implement.
     pub unsupported: Option<Unsupported>,
+    /// The run must be decided by the exhaustive search alone (`-dumpTrace` and `-loadTrace` write or read
+    /// files that a hunter would not produce or use the same way).
+    pub no_hunters: bool,
     /// `--cdot`: action composition (everystate's `-cdot`; TLC's `-Dtlc2.tool.impl.Tool.cdot=true`).
     pub cdot: bool,
     /// Library directories given with `-I`, hashed into the cache key.
@@ -117,9 +120,10 @@ pub fn parse(argv: &[String]) -> Invocation {
                 i += 1;
                 continue;
             }
-            // everystate accepts these on its command line but does not implement them: refused
+            // FORMAT FILE: everystate implements json and tla (dump) and json (load); it rejects the others itself
             "-dumptrace" | "-loadtrace" => {
-                inv.unsupported.get_or_insert("-dumpTrace/-loadTrace");
+                inv.writes_files = true;
+                inv.no_hunters = true;
                 for k in 1..=2 {
                     if let Some(v) = argv.get(i + k) {
                         inv.tlc_args.push(v.clone());
@@ -176,11 +180,13 @@ mod tests {
 
     #[test]
     fn tlc_only_features_are_routed() {
-        assert!(parse(&v("-config a.cfg a.tla -dumptrace json t.json")).unsupported.is_some());
-        assert!(parse(&v("-config a.cfg a.tla -dumpTrace json t.json")).unsupported.is_some());
+        let d = parse(&v("-config a.cfg a.tla -dumpTrace json t.json"));
+        assert!(d.unsupported.is_none() && d.no_hunters && d.writes_files);
+        assert_eq!(d.tlc_args, v("-config a.cfg a.tla -dumpTrace json t.json"));
+        assert!(parse(&v("-config a.cfg a.tla -dumptrace json t.json")).unsupported.is_none());
         assert!(parse(&v("-config a.cfg a.tla -continue")).unsupported.is_some());
         assert!(parse(&v("-config a.cfg a.tla -debugger nosuspend,port=4712")).unsupported.is_some());
-        assert!(parse(&v("-config a.cfg a.tla -loadTrace tlc t.bin")).unsupported.is_some());
+        assert!(parse(&v("-config a.cfg a.tla -loadTrace json t.json")).no_hunters);
         assert!(parse(&v("-config a.cfg a.tla -frobnicate")).unsupported.is_some());
     }
 
