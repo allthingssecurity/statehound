@@ -147,7 +147,7 @@ impl Depth {
                 area_timeout_min: 45,
                 area_minutes: (15.0, 35.0),
                 survey_minutes: (5.0, 10.0),
-                instructions: "SHORT run. Scope ladder: only the smallest interesting scope (2 actors, each failure bound 1); \
+                instructions: "SHORT run. Scope ladder: rung R1 only (2 actors, every applicable failure model with bound 1); \
                                do not climb. Reproduce against the real code only the most severe candidate bug of this area; \
                                list the others as model-only leads. Keep model.md brief.",
             },
@@ -157,8 +157,8 @@ impl Depth {
                 area_timeout_min: 90,
                 area_minutes: (35.0, 75.0),
                 survey_minutes: (10.0, 15.0),
-                instructions: "MEDIUM run. Scope ladder: the smallest scope, then at most two steps up (for example 3 actors, \
-                               then failure bounds 2). Reproduce against the real code every candidate bug of severity high or \
+                instructions: "MEDIUM run. Scope ladder: rungs R1 and R2, then R4 if the area has a `pairs_with` partner or shares \
+                               state with a neighbouring mechanism. Reproduce against the real code every candidate bug of severity high or \
                                critical; list lower ones as model-only leads unless they are cheap to reproduce.",
             },
             Depth::Full => DepthPlan {
@@ -167,9 +167,9 @@ impl Depth {
                 area_timeout_min: 180,
                 area_minutes: (60.0, 180.0),
                 survey_minutes: (15.0, 25.0),
-                instructions: "FULL run. Scope ladder: keep climbing (actors, failure bounds, messages, keys) until a check \
-                               exceeds the per-check budget or the code has no new behaviour at a larger scope; hunt the scope \
-                               that did not finish. Model every failure the code claims to handle. Reproduce every candidate \
+                instructions: "FULL run. Scope ladder: rungs R1 to R4, then keep climbing (failure bounds, messages, keys, actors) \
+                               until a check exceeds the per-check budget or the code has no new behaviour at a larger scope; \
+                               hunt the scope that did not finish. Model every applicable failure model in the catalogue. Reproduce every candidate \
                                bug against the real code.",
             },
         }
@@ -760,6 +760,26 @@ pub fn audit_markdown(repo: &Path, commit: &str, depth: Depth, p: &Profile, repo
     };
     block(&mut m, "Confirmed bugs", &confirmed);
     block(&mut m, "Model-only leads (not reproduced against the code)", &leads);
+    let fm: Vec<&(String, Value)> = reports.iter().filter(|(_, r)| r.get("failure_models").is_some()).collect();
+    if !fm.is_empty() {
+        let list = |v: Option<&Value>| -> String {
+            v.and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string()).or_else(|| x.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default()
+        };
+        m += "\n## Failure models\n\nWhich failure models each area put into its spec. A model that applies but was skipped is a gap in what was verified.\n\n| Area | Rungs | Modelled | Skipped | Not applicable |\n|---|---|---|---|---|\n";
+        for (id, r) in fm {
+            let f = r.get("failure_models");
+            m += &format!(
+                "| {} | {} | {} | {} | {} |\n",
+                id,
+                list(r.get("rungs")),
+                list(f.and_then(|f| f.get("modelled"))),
+                list(f.and_then(|f| f.get("skipped"))),
+                list(f.and_then(|f| f.get("not_applicable")))
+            );
+        }
+    }
     m += "\n## Verified\n\nNo violation within these bounds (an exhaustive check covers every state up to its scope).\n\n| Area | Property | Scope | Result |\n|---|---|---|---|\n";
     for (id, r) in reports {
         for v in r.get("verified").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
@@ -812,6 +832,18 @@ mod tests {
         assert_eq!(o.agent, Some(Agent::Codex));
         assert_eq!(o.parallel, 5);
         assert!(parse_options(&["/".into(), "--depth".into(), "huge".into()]).is_err());
+    }
+
+    #[test]
+    fn audit_markdown_lists_failure_model_coverage() {
+        let p = Profile { agent: Agent::Claude, name: "default".into(), config_dir: "/x".into(), program: "claude".into(), wrapper: false };
+        let r = serde_json::json!({"area":"a","status":"verified","findings":[],"verified":[],"rungs":["R1","R2"],
+            "failure_models":{"modelled":["throws","stop-start"],"not_applicable":["two-versions"],"skipped":[{"model":"partial-partition","why":"single node"}]}});
+        let md = audit_markdown(Path::new("/repo"), "abc", Depth::Medium, &p, &[("a".into(), r)], &[], 1.0);
+        assert!(md.contains("## Failure models"));
+        assert!(md.contains("| a | R1, R2 | throws, stop-start | partial-partition | two-versions |"));
+        let plain = audit_markdown(Path::new("/repo"), "abc", Depth::Medium, &p, &[("b".into(), serde_json::json!({"area":"b","status":"verified"}))], &[], 1.0);
+        assert!(!plain.contains("## Failure models"));
     }
 
     #[test]

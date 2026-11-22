@@ -25,6 +25,42 @@ is entirely delegated to a well-tested library and used in the documented way.
 Prefer mechanisms over directories: "the lock-renewal loop and its interaction with shutdown" is a
 better area than "package lock". One directory can hold several areas; one area can span directories.
 
+## Where the trickiest bugs are
+
+Studies of real production failures point to the same places again and again. Rank areas by how many of these
+they touch, not only by how much locking they contain:
+
+- **Error handling.** 92% of catastrophic failures in distributed systems come from mishandled non-fatal errors,
+  and a third of those come from trivial handlers: empty or log-only `catch` blocks, a broad `catch` that stops a
+  component or exits, a TODO (Yuan et al., OSDI 2014). The scan category `errors` counts them.
+- **Lifecycle vs. workers.** `doStart`/`doStop`/`close`/`reconnect`/rebalance callbacks that share fields with
+  worker, callback or timer threads. A stop that does not wait for the threads, then a start of the same
+  instance, lets old threads see the new state. The scan category `lifecycle` counts these methods, and
+  `lifecycle_threads` marks files that have both lifecycle methods and threads.
+- **Timeouts.** In timeout bugs, a timeout that is missing (31%) or wrongly sized (47%) is the most common cause,
+  and most give no error message. A timeout firing while the other side is still alive leads to a late
+  completion. The scan category `blocking` counts calls that wait with no deadline.
+- **Crash and restart.** Recovery that reads persisted state written non-atomically, or races with new work.
+  74% of crash-recovery bugs need only one crash.
+- **Stale views.** Caches, registries and pools read by control logic that can be stale or skip a transition, and
+  eviction of something still in use.
+- **Control markers.** Commit/abort/fence/epoch markers delayed or reordered against data (transactions,
+  offsets, acknowledgements).
+- **Formats across versions.** Persisted or wire formats (serialization, repositories, offset stores) that another
+  version or another system writes. Most upgrade failures come from such incompatibilities. The scan category
+  `persistence` counts them.
+- **Connectors.** Code at a system boundary, where markers, offsets, acknowledgements and headers cross into another
+  system. In the systems studied, connectors were under 5% of the code but received over half of the fixes.
+- **Two mechanisms together.** 80% of distributed concurrency bugs span more than one protocol. Note which areas
+  share state or exception handlers (`pairs_with`), so a hunt can combine them.
+
+For every candidate area, answer two questions before you choose it:
+
+1. What happens if each external call in it throws, or hangs?
+2. What persisted or wire state does it read that another thread, version or system writes?
+
+If you cannot answer both from the code, it is a weaker area.
+
 ## Output
 
 Write the file named in the task as a JSON array, most promising area first, at most the number of areas
@@ -39,7 +75,9 @@ the task allows. Each element:
   "shared_state": "lease row (owner, expiry), in-memory 'held' flag, renewal timer",
   "scenarios": ["node pauses past expiry then renews", "shutdown during renewal", "DB write times out but commits"],
   "properties": ["at most one node believes it holds the lease", "a released lease is never renewed"],
-  "why": "renewal reads expiry and writes owner in two statements without a version check (LeaseManager.java:88-104)",
+  "failure_models": ["throws", "timeout-alive", "crash-restart", "stop-start"],
+  "pairs_with": ["lock-release-on-shutdown"],
+  "why": "renewal reads expiry and writes owner in two statements without a version check (LeaseManager.java:88-104); the renewal catch block only logs (LeaseManager.java:121)",
   "priority": 1
 }
 ```
@@ -53,6 +91,8 @@ the task allows. Each element:
 | `shared_state` | the state they share |
 | `scenarios` | failures and orderings to model |
 | `properties` | what must always (or eventually) hold |
+| `failure_models` | which failure models from the hunt protocol's catalogue apply here: `throws`, `timeout-alive`, `no-timeout`, `crash-restart`, `stop-start`, `stale-view`, `delayed-marker`, `dup-reorder`, `partial-partition`, `two-versions`, `config-sweep`, `overload-retry` |
+| `pairs_with` | ids of other areas in this list that share state or exception handlers with this one (may be empty) |
 | `why` | the code evidence that ordering matters here |
 | `priority` | 1 = most promising |
 

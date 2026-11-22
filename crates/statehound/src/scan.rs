@@ -39,10 +39,21 @@ const SIGNALS: &[(&str, &str, &str, u32)] = &[
     ("jvm", "threads", "CompletableFuture", 2), ("jvm", "threads", "CountDownLatch", 2), ("jvm", "threads", "ConcurrentHashMap", 1),
     ("jvm", "transactions", "@Transactional", 3), ("jvm", "transactions", "setAutoCommit", 3), ("jvm", "transactions", "FOR UPDATE", 3),
     ("jvm", "transactions", "executeUpdate", 1),
+    // lifecycle methods that run while worker threads are still active (stop/start races)
+    ("jvm", "lifecycle", "doStart(", 2), ("jvm", "lifecycle", "doStop(", 2), ("jvm", "lifecycle", "doSuspend(", 2),
+    ("jvm", "lifecycle", "doResume(", 2), ("jvm", "lifecycle", "doShutdown(", 2), ("jvm", "lifecycle", "onPartitionsRevoked", 3),
+    ("jvm", "lifecycle", "onPartitionsAssigned", 2), ("jvm", "lifecycle", "onPartitionsLost", 3), ("jvm", "lifecycle", "shutdownNow(", 2),
+    // waits without a deadline (missing-timeout hangs)
+    ("jvm", "blocking", ".take()", 2), ("jvm", "blocking", ".await()", 2), ("jvm", "blocking", ".acquire()", 2),
+    ("jvm", "blocking", ".join()", 1), ("jvm", "blocking", "awaitUninterruptibly()", 2), ("jvm", "blocking", "acquireUninterruptibly(", 2),
+    ("jvm", "timeouts", "currentTimeMillis", 1),
+    // persisted or wire formats read by other versions or systems
+    ("jvm", "persistence", "serialVersionUID", 1), ("jvm", "persistence", "ObjectOutputStream", 2), ("jvm", "persistence", "ObjectInputStream", 2),
     // go
     ("go", "threads", "go func", 3), ("go", "locking", "sync.Mutex", 3), ("go", "locking", "sync.RWMutex", 3),
     ("go", "locking", ".Lock()", 2), ("go", "channels", "chan ", 2), ("go", "channels", "select {", 2), ("go", "atomics", "atomic.", 2),
     ("go", "threads", "sync.WaitGroup", 2), ("go", "transactions", ".BeginTx(", 3), ("go", "transactions", ".Begin(", 2),
+    ("go", "blocking", "context.Background()", 1), ("go", "lifecycle", "Shutdown(", 1),
     // rust
     ("rust", "locking", "Mutex<", 3), ("rust", "locking", "RwLock<", 3), ("rust", "locking", ".lock()", 2),
     ("rust", "atomics", "Atomic", 2), ("rust", "atomics", "Ordering::", 2), ("rust", "threads", "thread::spawn", 3),
@@ -74,8 +85,13 @@ const SIGNALS: &[(&str, &str, &str, u32)] = &[
     ("*", "messaging", "~at-least-once", 3), ("*", "caching", "~invalidat", 2), ("*", "caching", "~evict", 2), ("*", "caching", "~cache", 1),
     ("*", "recovery", "~recover", 2), ("*", "recovery", "~crash", 2), ("*", "recovery", "~fsync", 3), ("*", "recovery", "~checkpoint", 2),
     ("*", "recovery", "~rollback", 2), ("*", "locking", "~optimistic", 2), ("*", "locking", "~version", 1), ("*", "transactions", "~isolation", 2),
+    ("*", "lifecycle", "~reconnect", 2), ("*", "lifecycle", "~rebalanc", 2), ("*", "lifecycle", "~graceful", 1),
+    ("*", "caching", "~registry", 1), ("*", "caching", "~pool", 1), ("*", "persistence", "~journal", 2), ("*", "persistence", "~snapshot", 1),
+    ("*", "persistence", "~repository", 1), ("*", "persistence", "~serializ", 1),
 ];
 
+/// A directory is ranked by its this many highest-scoring files.
+const TOP_FILES: usize = 8;
 /// At most this many hits of one token count per file (one generated file must not dominate).
 const PER_FILE_CAP: u32 = 20;
 /// Files larger than this are skipped (generated or data).
@@ -91,7 +107,10 @@ pub struct FileScore {
 pub struct DirScore {
     pub dir: String,
     pub language: String,
+    /// sum of the scores of the `TOP_FILES` highest-scoring files
     pub score: u32,
+    /// sum over every file of the directory
+    pub all_files_score: u32,
     pub files: usize,
     pub signals: BTreeMap<String, u32>,
     pub top_files: Vec<FileScore>,
@@ -101,6 +120,13 @@ fn is_test_path(rel: &str) -> bool {
     let l = rel.to_ascii_lowercase();
     l.contains("/test/") || l.contains("/tests/") || l.starts_with("test/") || l.starts_with("tests/") || l.contains("_test.")
         || l.contains(".test.") || l.contains(".spec.") || l.ends_with("test.java") || l.ends_with("tests.java") || l.contains("/testing/")
+}
+
+/// User interfaces, command-line tools, examples and benchmarks: rarely hunt areas, and their error
+/// handling (log and carry on) is usually intended.
+fn is_peripheral_path(rel: &str) -> bool {
+    let l = rel.to_ascii_lowercase();
+    l.split('/').any(|seg| matches!(seg, "tui" | "ui" | "cli" | "commands" | "example" | "examples" | "demo" | "demos" | "sample" | "samples" | "benchmark" | "benchmarks" | "jmh"))
 }
 
 fn is_generated_path(rel: &str) -> bool {
@@ -129,6 +155,7 @@ pub fn score_text(lang: &str, text: &str) -> (u32, BTreeMap<String, u32>) {
     let lower = text.to_ascii_lowercase();
     let mut total = 0;
     let mut cats: BTreeMap<String, u32> = BTreeMap::new();
+    let mut life_code = 0;
     for (l, cat, tok, w) in SIGNALS {
         if *l != "*" && *l != lang {
             continue;
@@ -140,9 +167,199 @@ pub fn score_text(lang: &str, text: &str) -> (u32, BTreeMap<String, u32>) {
         if hits > 0 {
             total += hits * w;
             *cats.entry(cat.to_string()).or_insert(0) += hits;
+            if *cat == "lifecycle" && !tok.starts_with('~') {
+                life_code += hits;
+            }
         }
     }
+    // Error handling: 92% of catastrophic distributed-system failures come from mishandled non-fatal errors,
+    // a third of them from trivial handlers (Yuan et al., OSDI 2014).
+    let e = error_handlers(lang, text);
+    if e.total() > 0 {
+        total += e.total() * 3;
+        *cats.entry("errors".to_string()).or_insert(0) += e.total();
+    }
+    // Lifecycle methods in a file that also runs threads: the stop/start-while-workers-run class.
+    // Only lifecycle methods in code count here, not words in comments or generated docs.
+    let life = life_code;
+    let conc = ["threads", "async", "atomics", "locking"].iter().map(|c| cats.get(*c).copied().unwrap_or(0)).sum::<u32>();
+    if life > 0 && conc > 0 {
+        total += 4 * life.min(5);
+        cats.insert("lifecycle_threads".to_string(), life.min(5));
+    }
     (total, cats)
+}
+
+/// Suspicious error handlers in one file.
+#[derive(Debug, Default, PartialEq)]
+pub struct ErrorHandlers {
+    /// empty, log-only or TODO handlers
+    pub swallowed: u32,
+    /// `InterruptedException` caught without restoring the interrupt or rethrowing
+    pub interrupt_lost: u32,
+    /// a broad catch (`Exception`, `Throwable`, `RuntimeException`) that stops, shuts down or exits
+    pub broad_abort: u32,
+}
+
+impl ErrorHandlers {
+    pub fn total(&self) -> u32 {
+        self.swallowed + self.interrupt_lost + self.broad_abort
+    }
+}
+
+/// Removes `//` and `/* */` comments (and `#` comments for Python-like code is not needed here).
+fn strip_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    loop {
+        let line = rest.find("//");
+        let block = rest.find("/*");
+        match (line, block) {
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+            (Some(l), b) if b.map_or(true, |b| l < b) => {
+                out.push_str(&rest[..l]);
+                rest = rest[l..].find('\n').map(|n| &rest[l + n..]).unwrap_or("");
+            }
+            (_, Some(b)) => {
+                out.push_str(&rest[..b]);
+                rest = rest[b + 2..].find("*/").map(|n| &rest[b + 2 + n + 2..]).unwrap_or("");
+            }
+            _ => unreachable!(),
+        }
+    }
+    out
+}
+
+/// True when the handler body has at least one statement and every statement only logs or prints.
+fn only_logs(body: &str) -> bool {
+    const LOG: &[&str] = &["log.", "logger.", "log_", "logging.", "console.", "system.out.", "system.err.", "print(", "println", "debug(", "trace("];
+    let code = strip_comments(body);
+    let stmts: Vec<String> = code.split(';').map(|x| x.trim().to_ascii_lowercase()).filter(|x| !x.is_empty()).collect();
+    !stmts.is_empty() && stmts.iter().all(|st| LOG.iter().any(|p| st.starts_with(p)) || st.contains("printstacktrace("))
+}
+
+fn classify_handler(head: &str, body: &str, h: &mut ErrorHandlers) {
+    let b = body.trim();
+    let low = b.to_ascii_lowercase();
+    if strip_comments(b).trim().is_empty() || low.contains("todo") || low.contains("fixme") || only_logs(b) {
+        h.swallowed += 1;
+    } else if head.contains("InterruptedException") && !b.contains("interrupt()") && !b.contains("throw") {
+        h.interrupt_lost += 1;
+    }
+    let broad = head
+        .split(|c: char| c == '|' || c.is_whitespace() || c == '(' || c == ')')
+        .any(|t| matches!(t, "Exception" | "RuntimeException" | "Throwable" | "java.lang.Exception" | "java.lang.Throwable"));
+    if broad && (b.contains("System.exit") || b.contains(".stop(") || b.contains("stop()") || b.contains("shutdown") || b.contains("halt(")) {
+        h.broad_abort += 1;
+    }
+}
+
+/// Index just after the brace that closes the block opened at `open` (which must be `{`).
+fn block_end(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Finds catch/except handlers and classifies them. A textual scan: good enough to rank directories.
+pub fn error_handlers(lang: &str, text: &str) -> ErrorHandlers {
+    let mut h = ErrorHandlers::default();
+    let bytes = text.as_bytes();
+    let mut seen = 0u32;
+    match lang {
+        "jvm" | "csharp" | "js" => {
+            let mut from = 0;
+            while let Some(i) = text[from..].find("catch") {
+                let at = from + i;
+                from = at + 5;
+                if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_' || bytes[at - 1] == b'.') {
+                    continue;
+                }
+                let rest = &text[from..];
+                let trimmed = rest.trim_start();
+                let skip = rest.len() - trimmed.len();
+                let (head, brace) = if trimmed.starts_with('(') {
+                    match trimmed.find(')') {
+                        Some(close) => {
+                            let after = trimmed[close + 1..].trim_start();
+                            if !after.starts_with('{') {
+                                continue;
+                            }
+                            (&trimmed[1..close], from + skip + close + 1 + (trimmed[close + 1..].len() - after.len()))
+                        }
+                        None => continue,
+                    }
+                } else if trimmed.starts_with('{') {
+                    ("", from + skip)
+                } else {
+                    continue;
+                };
+                if let Some(end) = block_end(bytes, brace) {
+                    classify_handler(head, &text[brace + 1..end - 1], &mut h);
+                    seen += 1;
+                    if seen >= PER_FILE_CAP * 3 {
+                        break;
+                    }
+                }
+            }
+        }
+        "python" => {
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                let t = l.trim_start();
+                if !(t.starts_with("except") && t.trim_end().ends_with(':')) {
+                    continue;
+                }
+                let indent = l.len() - t.len();
+                let body: Vec<&str> = lines[i + 1..]
+                    .iter()
+                    .take_while(|x| x.trim().is_empty() || x.len() - x.trim_start().len() > indent)
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty())
+                    .collect();
+                let joined = body.join("\n");
+                if body.iter().all(|x| *x == "pass" || x.starts_with('#')) {
+                    h.swallowed += 1;
+                } else {
+                    classify_handler(t, &joined, &mut h);
+                }
+            }
+        }
+        "go" => {
+            let mut from = 0;
+            while let Some(i) = text[from..].find("if err != nil {") {
+                let open = from + i + "if err != nil ".len();
+                from = open + 1;
+                if let Some(end) = block_end(bytes, open) {
+                    let body = &text[open + 1..end - 1];
+                    if !body.contains("return") && !body.contains("panic(") && !body.contains("Fatal") && !body.contains("continue") && !body.contains("break") {
+                        h.swallowed += 1;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    h.swallowed = h.swallowed.min(PER_FILE_CAP);
+    h.interrupt_lost = h.interrupt_lost.min(PER_FILE_CAP);
+    h.broad_abort = h.broad_abort.min(PER_FILE_CAP);
+    h
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
@@ -195,6 +412,8 @@ pub fn scan(root: &Path) -> Vec<DirScore> {
         let (mut s, cats) = score_text(lang, &text);
         if is_test_path(&rel) || is_generated_path(&rel) {
             s /= 5; // tests show how a mechanism is used and generated code is not hand-written logic
+        } else if is_peripheral_path(&rel) {
+            s /= 3;
         }
         let dir = Path::new(&rel).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
         let d = dirs.entry(dir.clone()).or_insert_with(|| DirScore { dir: if dir.is_empty() { ".".into() } else { dir.clone() }, language: lang.into(), ..Default::default() });
@@ -210,7 +429,12 @@ pub fn scan(root: &Path) -> Vec<DirScore> {
     let mut v: Vec<DirScore> = dirs.into_values().filter(|d| d.score > 0).collect();
     for d in v.iter_mut() {
         d.top_files.sort_by(|a, b| b.score.cmp(&a.score).then(a.path.cmp(&b.path)));
-        d.top_files.truncate(8);
+        d.top_files.truncate(TOP_FILES);
+        // Rank by the strongest files, not the size of the directory: a focused component with one risky
+        // mechanism should not lose to a large utility package. On the Apache Camel audits this moved the
+        // directories of 43 confirmed bugs from a median rank of 48 to 33.
+        d.all_files_score = d.score;
+        d.score = d.top_files.iter().map(|f| f.score).sum();
     }
     v.sort_by(|a, b| b.score.cmp(&a.score).then(a.dir.cmp(&b.dir)));
     v
@@ -237,10 +461,11 @@ pub fn to_json(v: &[DirScore], limit: usize) -> String {
         let sig: Vec<String> = d.signals.iter().map(|(k, n)| format!("\"{}\":{}", json_escape(k), n)).collect();
         let files: Vec<String> = d.top_files.iter().map(|f| format!("{{\"path\":\"{}\",\"score\":{}}}", json_escape(&f.path), f.score)).collect();
         out += &format!(
-            "  {{\"dir\":\"{}\",\"language\":\"{}\",\"score\":{},\"files\":{},\"signals\":{{{}}},\"top_files\":[{}]}}{}\n",
+            "  {{\"dir\":\"{}\",\"language\":\"{}\",\"score\":{},\"all_files_score\":{},\"files\":{},\"signals\":{{{}}},\"top_files\":[{}]}}{}\n",
             json_escape(&d.dir),
             d.language,
             d.score,
+            d.all_files_score,
             d.files,
             sig.join(","),
             files.join(","),
@@ -266,6 +491,34 @@ mod tests {
         let (s3, c3) = score_text("python", "def renew_Lease(): retry until LEADER")
             ;
         assert!(s3 > 0 && c3.contains_key("distributed") && c3.contains_key("retries"));
+    }
+
+    #[test]
+    fn classifies_error_handlers() {
+        let java = r#"
+            try { a(); } catch (IOException e) { }
+            try { b(); } catch (IOException e) { LOG.warn("failed", e); }
+            try { c(); } catch (Exception e) { // TODO handle
+            }
+            try { d(); } catch (InterruptedException e) { done = true; }
+            try { d(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            try { e(); } catch (Exception e) { LOG.error("fatal", e); stop(); }
+            try { f(); } catch (IOException e) { throw new UncheckedIOException(e); }
+            try { g(); } catch (Throwable t) { System.exit(1); }
+        "#;
+        let h = error_handlers("jvm", java);
+        assert_eq!(h.swallowed, 3, "{:?}", h);
+        assert_eq!(h.interrupt_lost, 1, "{:?}", h);
+        assert_eq!(h.broad_abort, 2, "{:?}", h);
+        let py = "try:\n    x()\nexcept Exception:\n    pass\ntry:\n    y()\nexcept OSError as e:\n    raise\n";
+        assert_eq!(error_handlers("python", py).swallowed, 1);
+        let go = "if err != nil {\n log.Printf(\"x\")\n}\nif err != nil {\n return err\n}\n";
+        assert_eq!(error_handlers("go", go).swallowed, 1);
+        let js = "try { a() } catch { }\ntry { b() } catch (e) { throw e }\n";
+        assert_eq!(error_handlers("js", js).swallowed, 1);
+        // the error and lifecycle categories feed the directory score
+        let (s, c) = score_text("jvm", "protected void doStop() { executor.shutdownNow(); }\nExecutorService executor;\ntry { x(); } catch (Exception e) { }");
+        assert!(s > 0 && c.contains_key("errors") && c.contains_key("lifecycle") && c.contains_key("lifecycle_threads"), "{:?}", c);
     }
 
     #[test]
