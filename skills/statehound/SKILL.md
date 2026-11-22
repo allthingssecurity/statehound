@@ -30,9 +30,9 @@ scan  ->  survey  ->  parallel hunts (one per area)  ->  AUDIT.md
 
    | Depth | Hunt areas | Scope ladder | Reproduced against the code | Per area |
    |---|---|---|---|---|
-   | `short` | up to 4 | smallest scope only | the top finding of each area | 15–35 min |
-   | `medium` (default) | up to 8 | two steps up | high and critical findings | 35–75 min |
-   | `full` | up to 20 | climb until checks exceed the budget | every finding | 1–3 h |
+   | `short` | up to 4 | rung R1 only | the top finding of each area | 15–35 min |
+   | `medium` (default) | up to 8 | R1, R2, and R4 for paired areas | high and critical findings | 35–75 min |
+   | `full` | up to 20 | R1 to R4, then climb until checks exceed the budget | every finding | 1–3 h |
 
    Quote the estimate line of each dry run (wall clock and approximate cost). Per-area times are
    assumptions until the first areas finish; during the run `audit` prints a re-estimate after every
@@ -55,12 +55,16 @@ areas finish. `audit`:
 3. runs one **hunt** agent per area, `--parallel` at a time, each in its own git worktree of the repository
    (the user's checkout is never modified), following
    [references/hunt-protocol.md](references/hunt-protocol.md): model the mechanism, write the TLA+ spec,
-   check it with `statehound` on a growing scope ladder (2 actors, then 3, more failures, ...), triage
-   every counterexample, reproduce candidate bugs against the real code, and write `report.json`;
+   check it with `statehound` on the scope ladder (R1: 2 actors with every applicable failure model on;
+   R2: 3 actors or nodes, crash and restart, a partial partition; R3: more crashes, two versions; R4: two
+   paired areas together), triage every counterexample, reproduce candidate bugs against the real code, and
+   write `report.json`. Every spec covers the failure models of the protocol's catalogue that apply (a call
+   that throws, a timeout while the other side is alive, stop and start of the same instance, crash and
+   restart, a stale cache, delayed markers, ...), and `report.json` says which were modelled;
 4. writes **`AUDIT.md`** and `audit.json` in the output directory (default
    `~/.statehound/audits/<repo name>/`, outside the repository):
    confirmed bugs first, then model-only leads, then the areas verified clean with the scope each was
-   verified to.
+   verified to, and which failure models each area covered.
 
 Other options: `--out DIR`, `--areas FILE` (skip the survey and use your own queue), `--max-areas N`,
 `--check-budget SECONDS` and `--area-timeout MINUTES` (override the depth's defaults), `--model NAME`,

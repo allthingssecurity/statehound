@@ -99,20 +99,38 @@ The skill takes it from there:
 
    | Depth | Hunt areas | Scope ladder | Reproduced against the code | Per area |
    |---|---|---|---|---|
-   | `short` | up to 4 | smallest scope only | the top finding of each area | 15–35 min |
-   | `medium` | up to 8 | two steps up | high and critical findings | 35–75 min |
-   | `full` | up to 20 | until checks exceed the budget | every finding | 1–3 h |
+   | `short` | up to 4 | rung R1 only | the top finding of each area | 15–35 min |
+   | `medium` | up to 8 | R1, R2, and R4 for paired areas | high and critical findings | 35–75 min |
+   | `full` | up to 20 | R1 to R4, then until checks exceed the budget | every finding | 1–3 h |
 
 2. `statehound audit` **scans** every source file (Java, Go, Rust, Python, C/C++, C#, JS/TS, Kotlin,
-   Scala, Erlang/Elixir, Ruby) and scores each directory on concurrency and distributed-systems signals.
+   Scala, Erlang/Elixir, Ruby) and scores each directory on concurrency and distributed-systems signals,
+   including the places where studies of production failures find most bugs: empty, log-only and TODO
+   error handlers, lifecycle methods (`doStart`/`doStop`, rebalance callbacks) next to worker threads,
+   waits without a deadline, and persisted formats. Directories are ranked by their strongest files.
 3. One agent **surveys** the top candidates and writes the queue of hunt areas: the mechanism, its files,
    the actors, the shared state, the failures to model, and the properties that must hold.
 4. One agent per area **hunts**, several in parallel, each in its own git worktree (your checkout is never
-   touched): it models the mechanism, writes the TLA+ spec, checks it with `statehound` on a growing
-   scope ladder (2 actors, then 3, more failures, ...), triages every counterexample, and reproduces
-   candidate bugs against the real code with a test.
+   touched): it models the mechanism, writes the TLA+ spec, checks it with `statehound` on the scope
+   ladder, triages every counterexample, and reproduces candidate bugs against the real code with a test.
+   Small scopes find most real bugs (96% of concurrency bugs need 2 threads, 98% of distributed failures
+   show on 3 nodes), so the ladder spends its budget on **kinds of failure** rather than more actors:
+
+   | Rung | Scope |
+   |---|---|
+   | R1 | 2 actors, every applicable failure model on with bound 1 |
+   | R2 | 3 actors or nodes, a crash and a restart, a partial partition for distributed mechanisms |
+   | R3 | more crashes and a crash during recovery, 4–5 nodes, two versions of a persisted or wire format |
+   | R4 | two areas that share state or exception handlers, together |
+
+   The failure models come from those studies: a call that throws (92% of catastrophic failures come from
+   mishandled errors), a timeout while the other side is alive, a wait that never returns, stop and start
+   of the same instance, crash and restart from persisted state, stale caches and registries, delayed
+   commit/fence markers, duplicates and reordering, partial partitions, two versions, configuration
+   sweeps and retry overload. Each area says which it modelled.
 5. **`AUDIT.md`** lists confirmed bugs first (with trace, code locations and the reproduction), then
-   model-only leads, then the properties verified clean and the scope each was verified to.
+   model-only leads, then which failure models each area covered, then the properties verified clean and
+   the scope each was verified to.
 
 The time estimate is recomputed after every finished area from the measured durations of the run.
 Re-running the same command resumes. You can also run it directly:
