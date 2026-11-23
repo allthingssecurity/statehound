@@ -142,6 +142,33 @@ The skill takes it from there:
    the scope each was verified to.
 
 The time estimate is recomputed after every finished area from the measured durations of the run.
+
+### What an audit looks for
+
+Each hunt area is modelled with every failure model below that applies to its code, and the area's report says
+which it modelled. The models come from studies of production failures; the full wording given to the agents is in
+[hunt-protocol.md](skills/statehound/references/hunt-protocol.md).
+
+| Failure model | What the spec adds | Since |
+|---|---|---|
+| `throws`, `timeout-alive`, `no-timeout` | every external call can fail or hang; a timeout can fire while the other side still works | 0.2.0 |
+| `crash-restart`, `stop-start` | crash at any step and restart from persisted state; stop and start of the same instance while its threads run | 0.2.0 |
+| `stale-view`, `delayed-marker`, `dup-reorder`, `partial-partition` | stale caches; late commit/offset/ack markers; duplicated or reordered messages; one-way network cuts | 0.2.0 |
+| `two-versions`, `config-sweep` | old and new persisted formats; non-default configuration combinations | 0.2.0 |
+| `metastable` | retry storms and controllers feeding each other, checked from every state so the shock is already in place ([docs](docs/metastability.md)) | 0.3.0 |
+| `thread-death` | a periodic or background task that dies on one exception while the process lives | 0.4.0 |
+| `retry-semantics` | every retry checked for IF (right errors), WHEN (delay and cap) and HOW (state reset, idempotence) | 0.4.0 |
+| `gray-failure` | a health signal modelled apart from the work it vouches for: "healthy" must mean real progress | 0.4.0 |
+| `fail-slow` | a slow but alive dependency: held threads, permits and connections must stay bounded | 0.4.0 |
+
+The 0.4.0 models are explained, with their sources, in [docs/failure-models.md](docs/failure-models.md). To see two
+of them on a small spec:
+
+```sh
+cd examples/thread-death
+statehound -config Unguarded_Live.cfg   PeriodicRenewal.tla -deadlock   # one exception, renewal stops for good
+statehound -config Unguarded_Health.cfg PeriodicRenewal.tla -deadlock   # health says UP while nothing renews
+```
 Re-running the same command resumes. You can also run it directly:
 
 ```sh
