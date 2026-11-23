@@ -43,6 +43,8 @@ flowchart LR
   Boltzmann annealing, Good–Turing stopping) and why the hunters can never make a verdict wrong.
 - [Pipeline integration](docs/pipeline-integration.md): using Statehound inside a TLA+ bug-finding
   pipeline instead of Java.
+- [Metastability](docs/metastability.md): finding retry storms and controller feedback loops with
+  recovery-from-any-state checks.
 - [Results](docs/results.md): every number, how it was measured.
 
 ## Install
@@ -107,7 +109,8 @@ The skill takes it from there:
    Scala, Erlang/Elixir, Ruby) and scores each directory on concurrency and distributed-systems signals,
    including the places where studies of production failures find most bugs: empty, log-only and TODO
    error handlers, lifecycle methods (`doStart`/`doStop`, rebalance callbacks) next to worker threads,
-   waits without a deadline, and persisted formats. Directories are ranked by their strongest files.
+   waits without a deadline, persisted formats, and feedback loops (rate limiters, circuit breakers and
+   adaptive limits next to retries or timeouts). Directories are ranked by their strongest files.
 3. One agent **surveys** the top candidates and writes the queue of hunt areas: the mechanism, its files,
    the actors, the shared state, the failures to model, and the properties that must hold.
 4. One agent per area **hunts**, several in parallel, each in its own git worktree (your checkout is never
@@ -127,7 +130,9 @@ The skill takes it from there:
    mishandled errors), a timeout while the other side is alive, a wait that never returns, stop and start
    of the same instance, crash and restart from persisted state, stale caches and registries, delayed
    commit/fence markers, duplicates and reordering, partial partitions, two versions, configuration
-   sweeps and retry overload. Each area says which it modelled.
+   sweeps, and metastability: a retry storm or two controllers feeding each other, checked from every
+   state so the shock is already in place (see [docs/metastability.md](docs/metastability.md)). Each area
+   says which it modelled.
 5. **`AUDIT.md`** lists confirmed bugs first (with trace, code locations and the reproduction), then
    model-only leads, then which failure models each area covered, then the properties verified clean and
    the scope each was verified to.
@@ -176,6 +181,7 @@ nothing extra and was about 7% slower; see [docs/guided-hunting.md](docs/guided-
 | `patches/pipeline/` | patches that make the bug-finding pipeline use Statehound instead of Java |
 | `skills/statehound/` | the agent skill |
 | `examples/lost-update/` | the runnable example used throughout the docs |
+| `examples/retry-storm/` | metastability: a retry storm and two ticket controllers, checked from every state |
 | `docs/` | explainers and results |
 | `bench/` | benchmark scripts and raw results |
 | `scripts/install.sh` | build and install |

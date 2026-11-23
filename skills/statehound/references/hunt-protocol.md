@@ -45,7 +45,7 @@ first scope.
 | `partial-partition` | Connectivity is per pair and per direction: one node, preferably the leader, is cut off from some peers but not all. Check the invariants again after the partition heals. | 29% of partition failures need a partial partition, and all the ones studied can be triggered by partly isolating one node. |
 | `two-versions` | Each node or persisted record carries an old or new version tag, and readers must handle both. Add an upgrade action. | Most upgrade failures come from incompatible persisted or network data, and over 80% need only two versions. |
 | `config-sweep` | Key configuration flags become model constants (sync/async, transacted, eager, cache size, retry count, timeout relations). Check a few combinations in separate configs. | Many bugs only appear under one non-default setting. |
-| `overload-retry` | A bounded queue, a retry that re-enqueues on timeout, and a check that the overloaded state ends once the trigger is removed. | Retries keep metastable outages going. Treat this one as optional: TLA+ is weak on rates. |
+| `metastable` | Load as small counters (queue depth, retries in flight, permits, a controller's limit), a trigger (burst or slowdown) that can end, and the code's own feedback: retries and re-enqueues on timeout, controllers that change a limit from a metric. Checked from **every** state, not only `Init`, so a shock is already in place: see "Metastability" below. Replaces the older name `overload-retry`. | Metastable failures sustain themselves after the trigger is gone. They caused at least 4 of 15 major AWS outages in a decade, lasting 1.5 to 73 hours, and retries sustained more than half of the 22 incidents studied (Huang et al., OSDI 2022). Two individually sensible controllers on one resource can feed each other (Demirbas et al., ICCCN 2026). |
 
 Failures are often silent: 90% of partition failures give no error. So check the data, not only for
 exceptions: after recovery or healing, nothing is lost, duplicated, resurrected, stuck or leaked.
@@ -72,6 +72,53 @@ behaviour it allows and note the choice in `model.md`.
 
 Check the spec is not vacuous: temporarily add an invariant that must fail (for example that some
 action never happens) and make sure `statehound` reports it; then remove it.
+
+### Metastability (when `metastable` applies)
+
+A metastable failure is a degraded state that the system's own behaviour keeps going after the trigger
+(a burst, a slow dependency, a cache failure) has ended. It is invisible from the normal initial state: the
+loop needs the shock to be in place already. So these checks start from every state the type allows.
+
+Abstraction:
+
+- Load is a few small counters, bounded by constants of 4 to 8: queue depths, requests in flight, retries in
+  flight, permits or tickets, a controller's current limit. Separate **useful** work from **wasted** work (a
+  request whose client already timed out, a duplicate retry, churn) with a ghost variable.
+- Time is a tick: one `Tick` action applies the service capacity per tick and advances timers. Timeouts,
+  backoffs and controller periods are constants measured in ticks.
+- The trigger is a variable (`trigger \in {"on", "off"}`) with an action `TriggerEnds` and no way back on.
+  Arrivals from outside are bounded and happen only while the trigger is on.
+- Each retry layer (client, error handler, broker redelivery) and each controller is its own action, with a
+  comment citing the code. A controller's action keeps or reverts a change exactly as the code decides,
+  using the metric **as the code computes it**, next to a ghost variable for the true progress (useful
+  completions, or the backlog of useful work).
+
+Checks, each in its own config:
+
+| Property | Spec | A counterexample means |
+|---|---|---|
+| `Recovers` | `Init == TypeOK /\ trigger = "off"` (every shocked state), `Recovers == <>[]Healthy` under weak fairness of the code's own steps (service, controllers, retries), never of arrivals or the trigger | a loop the system sustains by itself: the trace ends in a cycle ("Back to state N") that never becomes healthy |
+| `HonestMetric` | action property: every controller step that keeps a change because its metric improved does not reduce true progress: `[][KeepChange => progress' >= progress]_vars` | the controller rewards itself for churn (more acquisitions per second with no more work done, a latency signal that improves because slow work was relabelled) |
+| `Settles` | two controllers on one resource, constant load: `<>[](UNCHANGED limits)` under weak fairness; controller periods as constants in a few configs (inner faster than outer, and equal) | the controllers oscillate or ratchet: one's correction degrades the other's environment |
+| `BoundedAmplification` | invariant: attempts per original request stay within the product the code intends (`attempts[r] <= MaxAttempts`) across every retry layer | stacked retries multiply the load on the layer below |
+
+`Healthy` must be checkable in one state: queues at or under their normal depth, no wasted work in
+flight, limits back at their resting value. Do not put the trigger or the arrivals under fairness, and do not
+let arrivals continue after `TriggerEnds`: otherwise every overload counterexample is trivial. Also check
+`Recovers` with the feedback switched off (a constant such as `Retry = FALSE`): it must pass, which shows
+the loop comes from the feedback and not from the abstraction. The example `examples/retry-storm/` shows
+the shape.
+
+Starting from every state multiplies the initial states, so keep counters small and model one loop at a
+time at R1: one server and one retry layer or one controller. At R2, add the second layer or the second
+controller. At R4, compose with the neighbouring controller (for example an admission control in front of a
+scheduler, a circuit breaker beside a throttler).
+
+Reproducing a metastable finding against the real code: drive the component with a burst or a slowdown,
+then remove it, and measure useful throughput and backlog per interval afterwards. Use a fake downstream
+whose latency the test controls and scaled-down timeouts. It is confirmed if useful throughput stays below
+its pre-trigger level for many times the trigger's length after the trigger ended, or if the controller's
+metric rises while useful throughput falls. Keep the per-interval numbers in `repro/`.
 
 ## 3. Check it, climbing the scope ladder
 
@@ -111,7 +158,10 @@ For each counterexample:
 
 1. Read the trace as a story: which actor did what, in which order, with which failure.
 2. Decide whether it is a **spec mistake** (the model allows something the code prevents; cite the code
-   that prevents it, fix the spec, re-check) or a **candidate bug** (the code allows it).
+   that prevents it, fix the spec, re-check) or a **candidate bug** (the code allows it). For a liveness
+   counterexample (`Recovers`, `Settles`, "nothing stuck"), read the cycle after "Back to state": it is a spec
+   mistake if the cycle only exists because a code step lacks fairness, or because arrivals or a failure
+   action keep firing inside it.
 3. For a candidate bug, reproduce it against the real code in the worktree: a test or a small program
    that forces the same order of events (threads with latches or barriers, a controllable clock, fault
    injection at the exact step, two processes against one database). Run it. Keep the test file and its

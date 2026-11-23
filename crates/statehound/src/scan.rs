@@ -88,6 +88,14 @@ const SIGNALS: &[(&str, &str, &str, u32)] = &[
     ("*", "lifecycle", "~reconnect", 2), ("*", "lifecycle", "~rebalanc", 2), ("*", "lifecycle", "~graceful", 1),
     ("*", "caching", "~registry", 1), ("*", "caching", "~pool", 1), ("*", "persistence", "~journal", 2), ("*", "persistence", "~snapshot", 1),
     ("*", "persistence", "~repository", 1), ("*", "persistence", "~serializ", 1),
+    // feedback: limiters, breakers and adaptive limits that, with retries, can sustain a metastable failure
+    ("*", "feedback", "~ratelimit", 3), ("*", "feedback", "~rate limit", 3), ("*", "feedback", "~circuitbreaker", 3),
+    ("*", "feedback", "~circuit breaker", 3), ("*", "feedback", "~bulkhead", 3), ("*", "feedback", "~throttl", 2),
+    ("*", "feedback", "~autoscal", 3), ("*", "feedback", "~adaptive", 2), ("*", "feedback", "~backpressure", 2),
+    ("*", "feedback", "~admission", 2), ("*", "feedback", "~congestion", 3), ("*", "feedback", "~utilization", 2),
+    ("*", "feedback", "~load shedding", 3), ("*", "feedback", "~setmaximumpoolsize(", 3), ("*", "feedback", "~setcorepoolsize(", 2),
+    ("jvm", "feedback", "CallerRunsPolicy", 2), ("jvm", "feedback", "RejectedExecutionHandler", 2),
+    ("go", "feedback", "rate.NewLimiter", 3), ("go", "feedback", "semaphore.NewWeighted", 2),
 ];
 
 /// A directory is ranked by its this many highest-scoring files.
@@ -186,6 +194,14 @@ pub fn score_text(lang: &str, text: &str) -> (u32, BTreeMap<String, u32>) {
     if life > 0 && conc > 0 {
         total += 4 * life.min(5);
         cats.insert("lifecycle_threads".to_string(), life.min(5));
+    }
+    // A limiter, breaker or adaptive limit in a file that also retries or times out: the feedback loop that
+    // sustains metastable failures (Huang et al., OSDI 2022: retries sustained more than half of the incidents).
+    let fb = cats.get("feedback").copied().unwrap_or(0);
+    let again = cats.get("retries").copied().unwrap_or(0) + cats.get("timeouts").copied().unwrap_or(0);
+    if fb > 0 && again > 0 {
+        total += 3 * fb.min(5);
+        cats.insert("feedback_loop".to_string(), fb.min(5));
     }
     (total, cats)
 }
@@ -519,6 +535,20 @@ mod tests {
         // the error and lifecycle categories feed the directory score
         let (s, c) = score_text("jvm", "protected void doStop() { executor.shutdownNow(); }\nExecutorService executor;\ntry { x(); } catch (Exception e) { }");
         assert!(s > 0 && c.contains_key("errors") && c.contains_key("lifecycle") && c.contains_key("lifecycle_threads"), "{:?}", c);
+    }
+
+    #[test]
+    fn marks_feedback_loops() {
+        // a limiter or breaker next to retries or timeouts is a feedback loop
+        let java = "RateLimiter limiter; CircuitBreaker breaker;\nvoid call() { for (int i = 0; i < maxRetries; i++) { retry(); } }";
+        let (s, c) = score_text("jvm", java);
+        assert!(c.get("feedback").copied().unwrap_or(0) >= 2 && c.contains_key("feedback_loop"), "{:?}", c);
+        // a limiter alone counts as feedback but not as a loop, and scores lower
+        let (s2, c2) = score_text("jvm", "RateLimiter limiter; CircuitBreaker breaker;");
+        assert!(c2.contains_key("feedback") && !c2.contains_key("feedback_loop") && s2 < s, "{:?}", c2);
+        // adaptive pool sizing from a utilization metric (Go)
+        let (_, c3) = score_text("go", "l := rate.NewLimiter(10, 1)\nctx, cancel := context.WithTimeout(ctx, d)\n// adjust by utilization");
+        assert!(c3.contains_key("feedback_loop"), "{:?}", c3);
     }
 
     #[test]

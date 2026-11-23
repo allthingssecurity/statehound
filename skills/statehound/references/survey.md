@@ -51,6 +51,15 @@ they touch, not only by how much locking they contain:
   `persistence` counts them.
 - **Connectors.** Code at a system boundary, where markers, offsets, acknowledgements and headers cross into another
   system. In the systems studied, connectors were under 5% of the code but received over half of the fixes.
+- **Feedback loops (metastability).** Retries, re-enqueues on timeout, and controllers that change a limit from a
+  metric (adaptive concurrency, autoscaling executors, rate limiters, circuit breakers, admission control). After a
+  burst or a slowdown ends, they can keep the system degraded by themselves. At least 4 of 15 major AWS outages in a
+  decade were metastable, and retries sustained more than half of the 22 incidents studied (Huang et al., OSDI 2022).
+  Two sensible controllers on one shared resource can feed each other, and a metric that churn inflates (operations
+  per second rather than useful work) rewards the wrong correction. For each controller, note what it measures,
+  what it changes, and which resource it shares; two controllers on one resource, or retry layers stacked on one
+  path, make a strong area. The scan category `feedback` counts limiters, breakers, throttles and adaptive limits,
+  and `feedback_loop` marks files where they meet retries or timeouts.
 - **Two mechanisms together.** 80% of distributed concurrency bugs span more than one protocol. Note which areas
   share state or exception handlers (`pairs_with`), so a hunt can combine them.
 
@@ -59,7 +68,8 @@ For every candidate area, answer two questions before you choose it:
 1. What happens if each external call in it throws, or hangs?
 2. What persisted or wire state does it read that another thread, version or system writes?
 
-If you cannot answer both from the code, it is a weaker area.
+If you cannot answer both from the code, it is a weaker area. For an area with retries or a controller, also
+answer a third: once a burst or a slowdown ends, what in this code keeps the extra work going?
 
 ## Output
 
@@ -91,7 +101,7 @@ the task allows. Each element:
 | `shared_state` | the state they share |
 | `scenarios` | failures and orderings to model |
 | `properties` | what must always (or eventually) hold |
-| `failure_models` | which failure models from the hunt protocol's catalogue apply here: `throws`, `timeout-alive`, `no-timeout`, `crash-restart`, `stop-start`, `stale-view`, `delayed-marker`, `dup-reorder`, `partial-partition`, `two-versions`, `config-sweep`, `overload-retry` |
+| `failure_models` | which failure models from the hunt protocol's catalogue apply here: `throws`, `timeout-alive`, `no-timeout`, `crash-restart`, `stop-start`, `stale-view`, `delayed-marker`, `dup-reorder`, `partial-partition`, `two-versions`, `config-sweep`, `metastable` |
 | `pairs_with` | ids of other areas in this list that share state or exception handlers with this one (may be empty) |
 | `why` | the code evidence that ordering matters here |
 | `priority` | 1 = most promising |
