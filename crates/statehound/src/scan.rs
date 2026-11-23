@@ -96,6 +96,15 @@ const SIGNALS: &[(&str, &str, &str, u32)] = &[
     ("*", "feedback", "~load shedding", 3), ("*", "feedback", "~setmaximumpoolsize(", 3), ("*", "feedback", "~setcorepoolsize(", 2),
     ("jvm", "feedback", "CallerRunsPolicy", 2), ("jvm", "feedback", "RejectedExecutionHandler", 2),
     ("go", "feedback", "rate.NewLimiter", 3), ("go", "feedback", "semaphore.NewWeighted", 2),
+    // periodic and background tasks that die quietly on one exception (partial failures)
+    ("jvm", "periodic", "scheduleAtFixedRate(", 3), ("jvm", "periodic", "scheduleWithFixedDelay(", 3),
+    ("jvm", "periodic", "new Timer(", 2), ("jvm", "periodic", "TimerTask", 2),
+    ("go", "periodic", "time.NewTicker(", 2), ("go", "periodic", "time.Tick(", 2),
+    ("rust", "periodic", "interval(", 2), ("js", "periodic", "setInterval(", 2), ("python", "periodic", "sched.", 1),
+    // health signals that can say healthy while the work is stuck (gray failure)
+    ("*", "health", "~healthcheck", 2), ("*", "health", "~health check", 2), ("*", "health", "~liveness", 2),
+    ("*", "health", "~readiness", 2), ("*", "health", "~ishealthy", 2), ("*", "health", "~isalive", 2),
+    ("*", "health", "~watchdog", 2),
 ];
 
 /// A directory is ranked by its this many highest-scoring files.
@@ -203,7 +212,29 @@ pub fn score_text(lang: &str, text: &str) -> (u32, BTreeMap<String, u32>) {
         total += 3 * fb.min(5);
         cats.insert("feedback_loop".to_string(), fb.min(5));
     }
+    // Scheduled or periodic tasks in a file with no broad catch: one exception stops the task for good while the
+    // process stays up (Lou et al., NSDI 2020: 48% of partial failures left functionality stuck).
+    let per = cats.get("periodic").copied().unwrap_or(0);
+    if per > 0 && !has_broad_catch(lang, text) {
+        total += 4 * per.min(5);
+        cats.insert("periodic_unguarded".to_string(), per.min(5));
+    }
     (total, cats)
+}
+
+/// True when the file catches broadly somewhere (`Throwable`, `Exception`, `RuntimeException`, a bare
+/// `except:`, a `recover()`), so a periodic task in it may be guarded. A textual check, good enough to rank.
+fn has_broad_catch(lang: &str, text: &str) -> bool {
+    match lang {
+        "jvm" | "csharp" | "js" => ["catch (Throwable", "catch (Exception", "catch (RuntimeException", "catch (final Throwable",
+            "catch (final Exception", "catch (e)", "catch {", "catch(Throwable", "catch(Exception"]
+            .iter()
+            .any(|p| text.contains(p)),
+        "python" => text.contains("except Exception") || text.contains("except:") || text.contains("except BaseException"),
+        "go" => text.contains("recover()"),
+        "rust" => text.contains("catch_unwind"),
+        _ => true,
+    }
 }
 
 /// Suspicious error handlers in one file.
@@ -549,6 +580,21 @@ mod tests {
         // adaptive pool sizing from a utilization metric (Go)
         let (_, c3) = score_text("go", "l := rate.NewLimiter(10, 1)\nctx, cancel := context.WithTimeout(ctx, d)\n// adjust by utilization");
         assert!(c3.contains_key("feedback_loop"), "{:?}", c3);
+    }
+
+    #[test]
+    fn marks_unguarded_periodic_tasks_and_health_signals() {
+        let unguarded = "executor.scheduleAtFixedRate(this::renew, 0, 5, TimeUnit.SECONDS);\nvoid renew() { lease.touch(); }";
+        let (s, c) = score_text("jvm", unguarded);
+        assert!(c.contains_key("periodic") && c.contains_key("periodic_unguarded"), "{:?}", c);
+        let guarded = "executor.scheduleAtFixedRate(this::renew, 0, 5, TimeUnit.SECONDS);\nvoid renew() { try { lease.touch(); } catch (Throwable t) { LOG.warn(\"x\", t); } }";
+        let (s2, c2) = score_text("jvm", guarded);
+        assert!(c2.contains_key("periodic") && !c2.contains_key("periodic_unguarded"), "{:?}", c2);
+        assert!(s2 < s + 10, "a swallowed catch scores as an error handler instead: {} vs {}", s2, s);
+        let (_, c3) = score_text("go", "t := time.NewTicker(d)\nfor range t.C { check() }");
+        assert!(c3.contains_key("periodic_unguarded"), "{:?}", c3);
+        let (_, c4) = score_text("jvm", "public HealthCheck.Result call() { return isHealthy() ? up() : down(); }");
+        assert!(c4.contains_key("health"), "{:?}", c4);
     }
 
     #[test]

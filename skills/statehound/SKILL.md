@@ -60,8 +60,9 @@ areas finish. `audit`:
    paired areas together), triage every counterexample, reproduce candidate bugs against the real code, and
    write `report.json`. Every spec covers the failure models of the protocol's catalogue that apply (a call
    that throws, a timeout while the other side is alive, stop and start of the same instance, crash and
-   restart, a stale cache, delayed markers, a retry storm or controller feedback loop checked from every
-   state, ...), and `report.json` says which were modelled;
+   restart, a stale cache, delayed markers, a thread that dies while the process lives, retries checked for
+   IF/WHEN/HOW, a health signal that lies, a slow dependency, a retry storm or controller feedback loop checked
+   from every state, ...), and `report.json` says which were modelled;
 4. writes **`AUDIT.md`** and `audit.json` in the output directory (default
    `~/.statehound/audits/<repo name>/`, outside the repository):
    confirmed bugs first, then model-only leads, then the areas verified clean with the scope each was

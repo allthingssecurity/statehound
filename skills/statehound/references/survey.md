@@ -51,6 +51,20 @@ they touch, not only by how much locking they contain:
   `persistence` counts them.
 - **Connectors.** Code at a system boundary, where markers, offsets, acknowledgements and headers cross into another
   system. In the systems studied, connectors were under 5% of the code but received over half of the fixes.
+- **Threads that die quietly.** A periodic or background task that throws stops for good while the process stays up:
+  `scheduleAtFixedRate` cancels the task after one exception, an executor keeps the exception in a future nobody
+  reads. In 100 partial failures, 48% left some functionality stuck (Lou et al., NSDI 2020). The scan category
+  `periodic` counts scheduled tasks and tickers, and `periodic_unguarded` marks files that schedule them without a
+  broad catch.
+- **Retries.** Every retry has three questions: IF (is this error worth retrying, and is a retryable one given up
+  on?), WHEN (is there a delay and a cap?), HOW (what state does attempt N see from attempt N-1, and is the retried
+  operation idempotent?). These classes cover the retry bugs found in eight open-source systems (Stoica et al.,
+  SOSP 2024).
+- **Health signals that lie.** Health checks, heartbeats, "started" flags and success counters that can say healthy
+  while the work they vouch for is stuck (gray failure, Huang et al., HotOS 2017). The scan category `health`
+  counts them.
+- **Slow, not dead.** A dependency that answers slowly holds threads, permits and connections; timeouts sized for a
+  dead peer may never fire (Gunawi et al., FAST 2018).
 - **Feedback loops (metastability).** Retries, re-enqueues on timeout, and controllers that change a limit from a
   metric (adaptive concurrency, autoscaling executors, rate limiters, circuit breakers, admission control). After a
   burst or a slowdown ends, they can keep the system degraded by themselves. At least 4 of 15 major AWS outages in a
@@ -101,7 +115,7 @@ the task allows. Each element:
 | `shared_state` | the state they share |
 | `scenarios` | failures and orderings to model |
 | `properties` | what must always (or eventually) hold |
-| `failure_models` | which failure models from the hunt protocol's catalogue apply here: `throws`, `timeout-alive`, `no-timeout`, `crash-restart`, `stop-start`, `stale-view`, `delayed-marker`, `dup-reorder`, `partial-partition`, `two-versions`, `config-sweep`, `metastable` |
+| `failure_models` | which failure models from the hunt protocol's catalogue apply here: `throws`, `timeout-alive`, `no-timeout`, `crash-restart`, `stop-start`, `stale-view`, `delayed-marker`, `dup-reorder`, `partial-partition`, `two-versions`, `config-sweep`, `thread-death`, `retry-semantics`, `gray-failure`, `fail-slow`, `metastable` |
 | `pairs_with` | ids of other areas in this list that share state or exception handlers with this one (may be empty) |
 | `why` | the code evidence that ordering matters here |
 | `priority` | 1 = most promising |

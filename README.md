@@ -43,6 +43,8 @@ flowchart LR
   Boltzmann annealing, Good–Turing stopping) and why the hunters can never make a verdict wrong.
 - [Pipeline integration](docs/pipeline-integration.md): using Statehound inside a TLA+ bug-finding
   pipeline instead of Java.
+- [Failure models](docs/failure-models.md): thread death, retry semantics, gray failure and fail-slow, with
+  the studies behind them.
 - [Metastability](docs/metastability.md): finding retry storms and controller feedback loops with
   recovery-from-any-state checks.
 - [Results](docs/results.md): every number, how it was measured.
@@ -130,9 +132,11 @@ The skill takes it from there:
    mishandled errors), a timeout while the other side is alive, a wait that never returns, stop and start
    of the same instance, crash and restart from persisted state, stale caches and registries, delayed
    commit/fence markers, duplicates and reordering, partial partitions, two versions, configuration
-   sweeps, and metastability: a retry storm or two controllers feeding each other, checked from every
-   state so the shock is already in place (see [docs/metastability.md](docs/metastability.md)). Each area
-   says which it modelled.
+   sweeps, a thread that dies while the process lives, retries checked for IF/WHEN/HOW, health signals
+   that say healthy while the work is stuck, slow-but-alive dependencies (see
+   [docs/failure-models.md](docs/failure-models.md)), and metastability: a retry storm or two controllers
+   feeding each other, checked from every state so the shock is already in place (see
+   [docs/metastability.md](docs/metastability.md)). Each area says which it modelled.
 5. **`AUDIT.md`** lists confirmed bugs first (with trace, code locations and the reproduction), then
    model-only leads, then which failure models each area covered, then the properties verified clean and
    the scope each was verified to.
@@ -181,6 +185,7 @@ nothing extra and was about 7% slower; see [docs/guided-hunting.md](docs/guided-
 | `patches/pipeline/` | patches that make the bug-finding pipeline use Statehound instead of Java |
 | `skills/statehound/` | the agent skill |
 | `examples/lost-update/` | the runnable example used throughout the docs |
+| `examples/thread-death/` | a periodic task that dies on one exception while the health check says UP |
 | `examples/retry-storm/` | metastability: a retry storm and two ticket controllers, checked from every state |
 | `docs/` | explainers and results |
 | `bench/` | benchmark scripts and raw results |
