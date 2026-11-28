@@ -1,6 +1,6 @@
 [package]
 name = "statehound"
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 license.workspace = true
 description = "Statehound: a drop-in replacement for Java TLC with the everystate engine, guided state-space hunters, a result cache and a TLC fallback"
