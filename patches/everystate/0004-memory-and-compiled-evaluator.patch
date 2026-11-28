@@ -1,0 +1,906 @@
+diff --git a/src/checker.rs b/src/checker.rs
+index b0c17c6..d97a011 100644
+--- a/src/checker.rs
++++ b/src/checker.rs
+@@ -455,6 +455,14 @@ impl<'a> Checker<'a> {
+ 
+     /// State `i`. The states found by the parallel search are kept serialized and rebuilt on demand.
+     pub fn state_at(&self, i: usize) -> StateRef {
++        #[cfg(not(target_arch = "wasm32"))]
++        if let Some(s) = self.rebuild_released(i) {
++            return s;
++        }
++        self.held(i).expect("a state without its parent")
++    }
++    /// State `i` when it is in memory, as a state or in serialized form.
++    fn held(&self, i: usize) -> Option<StateRef> {
+         let s = &self.states[i];
+         #[cfg(not(target_arch = "wasm32"))]
+         if Rc::ptr_eq(s, &self.empty) {
+@@ -462,7 +470,40 @@ impl<'a> Checker<'a> {
+                 return p.load(i, self.nvars);
+             }
+         }
+-        s.clone()
++        Some(s.clone())
++    }
++    /// State `i` when the parallel search released it (None otherwise), rebuilt as TLC rebuilds the
++    /// states of a trace: from the nearest ancestor still in memory, each state is the successor of its
++    /// parent that has its action and its fingerprint. Its parent was expanded by a worker, so expanding
++    /// it again has no effect but its successors; the statistics it touches are put back.
++    #[cfg(not(target_arch = "wasm32"))]
++    fn rebuild_released(&self, i: usize) -> Option<StateRef> {
++        if self.par.is_none() || self.held(i).is_some() {
++            return None;
++        }
++        let mut chain = vec![i];
++        let mut s = loop {
++            let p = self.parent[*chain.last().unwrap()];
++            assert!(p != NO_PARENT, "a released initial state");
++            match self.held(p as usize) {
++                Some(s) => break s,
++                None => chain.push(p as usize),
++            }
++        };
++        let ev = self.ev;
++        let (level, extra) = (ev.stats.level.get(), ev.extra_generated.get());
++        let (mut succs, mut acts) = (vec![], vec![]);
++        for &c in chain.iter().rev() {
++            ev.stats.level.set(self.level[self.parent[c] as usize] as i64);
++            succs.clear();
++            acts.clear();
++            let ok = self.successors(&s, &mut succs, &mut acts).is_ok();
++            let k = (0..if ok { succs.len() } else { 0 }).find(|&k| acts[k] as i32 == self.act[c] && self.fingerprint(&succs[k]).ok().and_then(|fp| self.fps.get(fp)) == Some(c as u32));
++            s = succs[k.expect("rebuilding a state of the trace: no successor of its parent has its fingerprint")].clone();
++        }
++        ev.stats.level.set(level);
++        ev.extra_generated.set(extra);
++        Some(s)
+     }
+ 
+     pub(crate) fn sync_stats(&self) {
+diff --git a/src/compile.rs b/src/compile.rs
+index 5ac94d4..efcc821 100644
+--- a/src/compile.rs
++++ b/src/compile.rs
+@@ -539,6 +539,89 @@ enum Found {
+     No,
+ }
+ 
++/// The local name `nm` stands for a value, not for an expression that may be a primed variable: it is
++/// bound to a slot or a constant, or it is a parameter whose argument is such a name (`x \in S` with `x`
++/// such a name is a condition, never an assignment).
++fn plain_name(sc: &Rc<Sc>, nm: Name, depth: u32) -> bool {
++    match lookup(sc, nm) {
++        Found::Slot(_) | Found::Const(_) => true,
++        Found::Arg(s) => match &s.k {
++            ScK::Arg { node, sc: asc, .. } if depth < 16 => match &node.e {
++                E::App { name, args, sel: None, r, .. } if args.is_empty() && matches!(r.get(), Res::Local) => plain_name(asc, *name, depth + 1),
++                E::Num(_) | E::Bool(_) | E::Str(..) => true,
++                _ => false,
++            },
++            _ => false,
++        },
++        _ => false,
++    }
++}
++
++/// Nothing reachable from `n` primes, assigns or asks what is enabled (`primeless`), and no local name in
++/// it stands for an expression that might: each is bound inside `n`, to a slot or a constant, or is a
++/// parameter whose argument is itself such an expression.
++fn pure_cond(n: N, sc: &Rc<Sc>, bound: &mut Vec<Name>, depth: u32) -> bool {
++    if depth > 16 || !primeless(n, &mut HashSet::new()) {
++        return false;
++    }
++    fn walk(n: N, sc: &Rc<Sc>, bound: &mut Vec<Name>, depth: u32) -> bool {
++        let mark = bound.len();
++        let add = |b: &Bound, bound: &mut Vec<Name>| {
++            if let Some(ns) = &b.names {
++                bound.extend(ns.iter().copied());
++            }
++            if let Some(ns) = &b.tuple {
++                bound.extend(ns.iter().copied());
++            }
++        };
++        let r = match &n.e {
++            E::App { name, args, r, .. } if matches!(r.get(), Res::Local) => {
++                args.iter().all(|a| walk(a, sc, bound, depth))
++                    && (bound.contains(name)
++                        || match lookup(sc, *name) {
++                            Found::Slot(_) | Found::Const(_) => true,
++                            Found::Arg(s) => match &s.k {
++                                ScK::Arg { node, sc: asc, .. } => pure_cond(node, asc, &mut Vec::new(), depth + 1),
++                                _ => false,
++                            },
++                            _ => false,
++                        })
++            }
++            E::Quant { bounds, body, .. } | E::FnDef { bounds, body, .. } => {
++                let sets = bounds.iter().all(|b| b.set.as_ref().map_or(false, |s| walk(s, sc, bound, depth)));
++                if let E::FnDef { recname: Some(rn), .. } = &n.e {
++                    bound.push(*rn);
++                }
++                for b in bounds {
++                    add(b, bound);
++                }
++                sets && walk(body, sc, bound, depth)
++            }
++            E::SetMap { e, bounds } => {
++                let sets = bounds.iter().all(|b| b.set.as_ref().map_or(false, |s| walk(s, sc, bound, depth)));
++                for b in bounds {
++                    add(b, bound);
++                }
++                sets && walk(e, sc, bound, depth)
++            }
++            E::Choose { bound: b, body } | E::SetFilter { bound: b, pred: body } => {
++                let set = b.set.as_ref().map_or(false, |s| walk(s, sc, bound, depth));
++                add(b, bound);
++                set && walk(body, sc, bound, depth)
++            }
++            E::Let { .. } | E::Lambda { .. } => false,
++            _ => {
++                let mut all = true;
++                for_children(n, &mut |c| all = all && walk(c, sc, bound, depth));
++                all
++            }
++        };
++        bound.truncate(mark);
++        r
++    }
++    walk(n, sc, bound, depth)
++}
++
+ fn lookup(sc: &Rc<Sc>, nm: Name) -> Found {
+     let mut cur = Some(sc);
+     let mut head: Option<&Rc<Sc>> = None;
+@@ -689,7 +772,24 @@ impl Comp {
+         if level_of(n) >= 2 {
+             self.unstable = true;
+         }
+-        fb(n, sc)
++        let f = fb(n, sc);
++        if crate::modules::closed_const(n) {
++            // A closed constant ([Tasks -> 0..N], S \X T, ...) has one value: the tree-walker computes it
++            // once, and later evaluations take it from here (with its enumeration, which sets cache).
++            // Only a value that does not hold an evaluation context is kept; an error is not.
++            let memo: OnceCell<Value> = OnceCell::new();
++            return Box::new(move |cx| {
++                if let Some(v) = memo.get() {
++                    return Ok(v.clone());
++                }
++                let v = f(cx)?;
++                if !crate::eval::captures_ctx(&v) {
++                    let _ = memo.set(v.clone());
++                }
++                Ok(v)
++            });
++        }
++        f
+     }
+ 
+     /// The scope and prologue for inlining a definition: its parameters bound by name to the arguments.
+@@ -1709,6 +1809,34 @@ impl Comp {
+                     mk_set(out)
+                 })
+             }
++            K::Subseteq => {
++                // as the tree-walker (Evaluator K::Subseteq); what it reports as an error, compiled code
++                // leaves to it
++                let (x, y) = (self.expr(&a[0], sc), self.expr(&a[1], sc));
++                Box::new(move |cx| {
++                    let (mut x, mut y) = (as_set(x(cx)?)?, as_set(y(cx)?)?);
++                    loop {
++                        let (bx, by) = match (&x.k, &y.k) {
++                            (SetK::Subset(bx), SetK::Subset(by)) => (bx.clone(), by.clone()),
++                            _ => break,
++                        };
++                        x = bx;
++                        y = by;
++                    }
++                    if !x.enumerable() {
++                        return bail();
++                    }
++                    if let (SetK::Interval(l1, h1), SetK::Interval(l2, h2)) = (&x.k, &y.k) {
++                        return Ok(Value::Bool(h1 < l1 || (l1 >= l2 && h1 <= h2)));
++                    }
++                    for e in x.elems()? {
++                        if !y.contains(e)? {
++                            return Ok(Value::Bool(false));
++                        }
++                    }
++                    Ok(Value::Bool(true))
++                })
++            }
+             K::Tuple => {
+                 let ces: Vec<CE> = a.iter().map(|x| self.expr(x, sc)).collect();
+                 Box::new(move |cx| {
+@@ -1926,7 +2054,7 @@ impl Comp {
+                             // the left side may still denote a primed variable (a parameter, a definition)
+                             E::Op(K::Prime, _) | E::Let { .. } => fb_act(n, sc),
+                             E::App { name, args, sel, r, .. } if args.is_empty() => match r.get() {
+-                                Res::Local if sel.is_none() && matches!(lookup(sc, *name), Found::Slot(_) | Found::Const(_)) => self.guard(n, sc),
++                                Res::Local if sel.is_none() && plain_name(sc, *name, 0) => self.guard(n, sc),
+                                 Res::Decl(d) if sel.is_none() && d.subst.get().is_none() => self.guard(n, sc),
+                                 _ => fb_act(n, sc),
+                             },
+@@ -2016,6 +2144,8 @@ impl Comp {
+                     })
+                 }
+                 // the enumerator has its own rules for these
++                // a condition that cannot prime or assign anything is evaluated as an expression
++                K::Imp | K::Subseteq if pure_cond(n, sc, &mut Vec::new(), 0) => self.guard(n, sc),
+                 K::Imp | K::Subseteq | K::BoxAct | K::AngleAct | K::Cdot => fb_act(n, sc),
+                 _ => self.guard(n, sc),
+             },
+diff --git a/src/eval.rs b/src/eval.rs
+index 71fc799..d897587 100644
+--- a/src/eval.rs
++++ b/src/eval.rs
+@@ -380,7 +380,7 @@ pub fn check_stack() -> R<()> {
+     Ok(())
+ }
+ 
+-fn captures_ctx(v: &Value) -> bool {
++pub(crate) fn captures_ctx(v: &Value) -> bool {
+     fn set(s: &SetV) -> bool {
+         match &s.k {
+             SetK::Filter(_) => true,
+diff --git a/src/modules.rs b/src/modules.rs
+index 1ce5a6b..6f49510 100644
+--- a/src/modules.rs
++++ b/src/modules.rs
+@@ -982,100 +982,108 @@ pub fn for_children(n: N, f: &mut dyn FnMut(N)) {
+     }
+ }
+ 
+-/// Is the parameterless LET definition `d` a closed constant: no state, no free local identifier (parameter,
+-/// bound variable, outer LET definition) and only operators without side effects? Its value is then the same
+-/// wherever the LET is evaluated, and the evaluator computes it once.
+-pub fn let_closed(d: &'static DefNode) -> bool {
+-    let c = d.closed.get();
+-    if c >= 0 {
+-        return c == 1;
++/// Is the expression `n` a closed constant: constant-level, no free local identifier and only operators
++/// without side effects? It has one value wherever it is evaluated.
++pub fn closed_const(n: N) -> bool {
++    level_of(n) == 0 && closed_ok(n, &mut Vec::new())
++}
++
++fn names(b: &'static Bound, bound: &mut Vec<Name>) {
++    if let Some(ns) = &b.names {
++        bound.extend(ns.iter().copied());
+     }
+-    fn names(b: &'static Bound, bound: &mut Vec<Name>) {
+-        if let Some(ns) = &b.names {
+-            bound.extend(ns.iter().copied());
+-        }
+-        if let Some(ns) = &b.tuple {
+-            bound.extend(ns.iter().copied());
+-        }
++    if let Some(ns) = &b.tuple {
++        bound.extend(ns.iter().copied());
+     }
+-    // true: `n` is fine
+-    fn ok(n: N, bound: &mut Vec<Name>) -> bool {
+-        let mark = bound.len();
+-        let r = match &n.e {
+-            E::At | E::StepRef | E::AssumeProve | E::TQuant { .. } => false,
+-            E::App { name, args, sel, r, .. } => {
+-                sel.is_none()
+-                    && match r.get() {
+-                        Res::Local => bound.contains(name),
+-                        Res::Decl(dc) => !dc.is_var && dc.subst.get().is_none() && dc.arity == 0,
+-                        Res::Def(x) => {
+-                            let x = x.resolved();
+-                            if x.inst.is_some() {
+-                                false
+-                            } else if x.builtin.get().is_some() {
+-                                // standard modules whose operators are pure functions of their arguments
+-                                matches!(&*x.module.to_string(), "Naturals" | "Integers" | "Reals" | "Sequences" | "FiniteSets" | "Bags")
+-                            } else {
+-                                // a user constant: evaluated once anyway
+-                                x.params.is_empty() && def_level(x) == 0
+-                            }
++}
++// true: `n` is fine
++fn closed_ok(n: N, bound: &mut Vec<Name>) -> bool {
++    let mark = bound.len();
++    let r = match &n.e {
++        E::At | E::StepRef | E::AssumeProve | E::TQuant { .. } => false,
++        E::App { name, args, sel, r, .. } => {
++            sel.is_none()
++                && match r.get() {
++                    Res::Local => bound.contains(name),
++                    Res::Decl(dc) => !dc.is_var && dc.subst.get().is_none() && dc.arity == 0,
++                    Res::Def(x) => {
++                        let x = x.resolved();
++                        if x.inst.is_some() {
++                            false
++                        } else if x.builtin.get().is_some() {
++                            // standard modules whose operators are pure functions of their arguments
++                            // (and BOOLEAN, STRING: the constants of `<builtin>`)
++                    matches!(&*x.module.to_string(), "Naturals" | "Integers" | "Reals" | "Sequences" | "FiniteSets" | "Bags" | "<builtin>")
++                        } else {
++                            // a user constant: evaluated once anyway
++                            x.params.is_empty() && def_level(x) == 0
+                         }
+-                        Res::None => false,
+                     }
+-                    && args.iter().all(|a| ok(a, bound))
+-            }
+-            E::Quant { bounds, body, .. } | E::FnDef { bounds, body, .. } => {
+-                let sets = bounds.iter().all(|b| b.set.as_ref().map_or(false, |s| ok(s, bound)));
+-                if let E::FnDef { recname: Some(rn), .. } = &n.e {
+-                    bound.push(*rn);
+-                }
+-                for b in bounds {
+-                    names(b, bound);
+-                }
+-                sets && ok(body, bound)
+-            }
+-            E::SetMap { e, bounds } => {
+-                let sets = bounds.iter().all(|b| b.set.as_ref().map_or(false, |s| ok(s, bound)));
+-                for b in bounds {
+-                    names(b, bound);
++                    Res::None => false,
+                 }
+-                sets && ok(e, bound)
++                && args.iter().all(|a| closed_ok(a, bound))
++        }
++        E::Quant { bounds, body, .. } | E::FnDef { bounds, body, .. } => {
++            let sets = bounds.iter().all(|b| b.set.as_ref().map_or(false, |s| closed_ok(s, bound)));
++            if let E::FnDef { recname: Some(rn), .. } = &n.e {
++                bound.push(*rn);
+             }
+-            E::Choose { bound: b, body } | E::SetFilter { bound: b, pred: body } => {
+-                let set = b.set.as_ref().map_or(false, |s| ok(s, bound));
++            for b in bounds {
+                 names(b, bound);
+-                set && ok(body, bound)
+             }
+-            E::Lambda { params, body } => {
+-                bound.extend(params.iter().map(|p| p.name));
+-                ok(body, bound)
++            sets && closed_ok(body, bound)
++        }
++        E::SetMap { e, bounds } => {
++            let sets = bounds.iter().all(|b| b.set.as_ref().map_or(false, |s| closed_ok(s, bound)));
++            for b in bounds {
++                names(b, bound);
+             }
+-            E::Let { defs, body } => {
+-                let mut all = true;
+-                for d in defs {
+-                    match d {
+-                        LetDef::Inst(_) => all = false,
+-                        LetDef::Def(d) => {
+-                            bound.push(d.name); // recursive LET operators refer to themselves
+-                            let m2 = bound.len();
+-                            bound.extend(d.params.iter().map(|p| p.name));
+-                            all = all && ok(&d.body, bound);
+-                            bound.truncate(m2);
+-                        }
++            sets && closed_ok(e, bound)
++        }
++        E::Choose { bound: b, body } | E::SetFilter { bound: b, pred: body } => {
++            let set = b.set.as_ref().map_or(false, |s| closed_ok(s, bound));
++            names(b, bound);
++            set && closed_ok(body, bound)
++        }
++        E::Lambda { params, body } => {
++            bound.extend(params.iter().map(|p| p.name));
++            closed_ok(body, bound)
++        }
++        E::Let { defs, body } => {
++            let mut all = true;
++            for d in defs {
++                match d {
++                    LetDef::Inst(_) => all = false,
++                    LetDef::Def(d) => {
++                        bound.push(d.name); // recursive LET operators refer to themselves
++                        let m2 = bound.len();
++                        bound.extend(d.params.iter().map(|p| p.name));
++                        all = all && closed_ok(&d.body, bound);
++                        bound.truncate(m2);
+                     }
+                 }
+-                all && ok(body, bound)
+-            }
+-            _ => {
+-                let mut all = true;
+-                for_children(n, &mut |c| all = all && ok(c, bound));
+-                all
+             }
+-        };
+-        bound.truncate(mark);
+-        r
++            all && closed_ok(body, bound)
++        }
++        _ => {
++            let mut all = true;
++            for_children(n, &mut |c| all = all && closed_ok(c, bound));
++            all
++        }
++    };
++    bound.truncate(mark);
++    r
++}
++
++/// Is the parameterless LET definition `d` a closed constant: no state, no free local identifier (parameter,
++/// bound variable, outer LET definition) and only operators without side effects? Its value is then the same
++/// wherever the LET is evaluated, and the evaluator computes it once.
++pub fn let_closed(d: &'static DefNode) -> bool {
++    let c = d.closed.get();
++    if c >= 0 {
++        return c == 1;
+     }
+-    let r = d.params.is_empty() && level_of(&d.body) == 0 && ok(&d.body, &mut Vec::new());
++    let r = d.params.is_empty() && level_of(&d.body) == 0 && closed_ok(&d.body, &mut Vec::new());
+     d.closed.set(r as i8);
+     r
+ }
+diff --git a/src/par.rs b/src/par.rs
+index 579fb90..302abe9 100644
+--- a/src/par.rs
++++ b/src/par.rs
+@@ -30,6 +30,11 @@
+ //!
+ //! States found by a parallel level exist as bytes only; `Checker::state_at` rebuilds one for a trace,
+ //! and `finish` rebuilds all of them when the state graph is going to be read (`-dump`, liveness).
++//! When nothing will read them (no state graph, no debugger, no VIEW or SYMMETRY), the bytes of a level
++//! are released once the level has been expanded, and a state of it is rebuilt for a trace as TLC
++//! rebuilds one: by expanding its parent again (see `Par::release` and `Checker::state_at`). Only the
++//! initial states and the last two levels then stay in memory, and a check needs a fraction of it.
++//! EVERYSTATE_KEEP_STATES=1 keeps every level.
+ //!
+ //! Test hooks (environment): EVERYSTATE_PAR_MIN, EVERYSTATE_PAR_CHUNK (see `cli::par_config`) and
+ //! EVERYSTATE_PAR_DEBUG (a summary of what the workers did, on standard error).
+@@ -494,21 +499,51 @@ impl De {
+     }
+ }
+ 
+-/// Consecutive states in serialized form: state `base + i` is `bytes[offs[i]..offs[i + 1]]`.
++/// Consecutive states in serialized form, state `base + i` at `starts[i]` (segment << 32 | offset).
++/// The bytes are kept in segments (up to SEG bytes) that are allocated once, never grown: a growing
++/// buffer holds up to twice its contents, and both copies while it moves. A state lies in one segment,
++/// so it ends where the next state starts or, when that one starts a new segment, where its segment ends.
+ pub struct Batch {
+     base: usize,
+-    offs: Vec<usize>,
+-    bytes: Vec<u8>,
++    starts: Vec<u64>,
++    segs: Vec<Vec<u8>>,
++    released: bool,
+ }
++const SEG: usize = 16 << 20;
+ impl Batch {
+     fn new(base: usize) -> Batch {
+-        Batch { base, offs: vec![0], bytes: Vec::new() }
++        Batch { base, starts: vec![], segs: vec![], released: false }
+     }
+     fn len(&self) -> usize {
+-        self.offs.len() - 1
++        self.starts.len()
++    }
++    /// Released (see `Par::release`): the states are known by id only.
++    fn released(&self) -> bool {
++        self.released
+     }
+     fn get(&self, i: usize) -> &[u8] {
+-        &self.bytes[self.offs[i]..self.offs[i + 1]]
++        let (seg, off) = ((self.starts[i] >> 32) as usize, (self.starts[i] & 0xFFFF_FFFF) as usize);
++        let end = match self.starts.get(i + 1) {
++            Some(&n) if (n >> 32) as usize == seg => (n & 0xFFFF_FFFF) as usize,
++            _ => self.segs[seg].len(),
++        };
++        &self.segs[seg][off..end]
++    }
++    fn push(&mut self, b: &[u8]) {
++        let fits = self.segs.last().is_some_and(|s| s.capacity() - s.len() >= b.len());
++        if !fits {
++            // small batches stay small: a new segment is as large as the batch so far, up to SEG
++            let total: usize = self.segs.iter().map(|s| s.len()).sum();
++            self.segs.push(Vec::with_capacity(total.clamp(64 << 10, SEG).max(b.len())));
++        }
++        let seg = self.segs.len() - 1;
++        let s = &mut self.segs[seg];
++        self.starts.push((seg as u64) << 32 | s.len() as u64);
++        s.extend_from_slice(b);
++    }
++    /// Bytes held (for EVERYSTATE_PAR_DEBUG).
++    fn held(&self) -> usize {
++        self.segs.iter().map(|s| s.capacity()).sum::<usize>() + self.starts.capacity() * 8
+     }
+ }
+ 
+@@ -546,6 +581,9 @@ struct Job {
+     /// the states are the candidates for initial states, not a level
+     init: bool,
+     frontier: Arc<Batch>,
++    /// the positions of the frontier to expand: `lo .. hi`
++    lo: usize,
++    hi: usize,
+     lvl: u32,
+     chunk: usize,
+     next: AtomicUsize,
+@@ -651,9 +689,9 @@ fn worker_main(factory: Arc<dyn Fn() -> R<Model> + Send + Sync>, flags: Flags, r
+         let mut local = FpSet::with_capacity(1 << 10);
+         {
+             let fps = job.fps.read().unwrap_or_else(|e| e.into_inner());
+-            let n = job.frontier.len();
++            let n = job.hi;
+             loop {
+-                let start = job.next.fetch_add(1, Ordering::Relaxed).saturating_mul(job.chunk);
++                let start = job.next.fetch_add(1, Ordering::Relaxed).saturating_mul(job.chunk).saturating_add(job.lo);
+                 if start >= n || start > job.stop.load(Ordering::Relaxed) {
+                     break;
+                 }
+@@ -901,8 +939,8 @@ impl Engine {
+         }
+     }
+     /// Has the workers expand a level; the reports sorted by position, and where they stopped.
+-    fn run(&mut self, init: bool, frontier: Arc<Batch>, lvl: u32, chunk: usize) -> (Vec<ChunkOut>, usize) {
+-        let job = Arc::new(Job { init, frontier, lvl, chunk, next: AtomicUsize::new(0), stop: AtomicUsize::new(usize::MAX), fps: self.fps.clone() });
++    fn run(&mut self, init: bool, frontier: Arc<Batch>, lo: usize, hi: usize, lvl: u32, chunk: usize) -> (Vec<ChunkOut>, usize) {
++        let job = Arc::new(Job { init, frontier, lo, hi, lvl, chunk, next: AtomicUsize::new(0), stop: AtomicUsize::new(usize::MAX), fps: self.fps.clone() });
+         for tx in &self.txs {
+             tx.send(ToWorker::Level(job.clone())).expect("a worker thread stopped unexpectedly");
+         }
+@@ -934,6 +972,13 @@ pub struct Par {
+     engine: Option<Engine>,
+     /// the states found by parallel levels, by ascending first id
+     store: Vec<Arc<Batch>>,
++    /// Whether the batches of expanded levels may be released. Every state of a batch that `level`
++    /// found is a successor of a state a worker expanded, and a worker expands a state only when doing so
++    /// has no effect but its successors (no Print, TLCSet, ...): expanding that state again rebuilds the
++    /// successor, with nothing else happening. The initial states (base 0) are always kept.
++    release: bool,
++    /// for EVERYSTATE_PAR_DEBUG: the most bytes of states held at the start of a level
++    held_max: usize,
+     /// the states the last parallel level found: the next level, already serialized
+     next: Option<Arc<Batch>>,
+     de: RefCell<De>,
+@@ -952,7 +997,8 @@ pub fn prepare(ck: &mut Checker) {
+     if let Some(cfg) = ck.opts.par.clone() {
+         if cfg.workers > 1 {
+             let t0 = ck.t_start;
+-            ck.par = Some(Box::new(Par { cfg, engine: None, store: vec![], next: None, de: RefCell::new(De::default()), t0, off: false, strikes: 0, stats: (0, 0, None), times: (0.0, 0.0, 0.0) }));
++            let release = !ck.opts.record_graph && !ck.ev.dbg.get() && ck.model.symmetry.is_none() && ck.model.view.is_none() && std::env::var_os("EVERYSTATE_KEEP_STATES").is_none_or(|v| v.is_empty() || v == "0");
++            ck.par = Some(Box::new(Par { cfg, engine: None, store: vec![], release, held_max: 0, next: None, de: RefCell::new(De::default()), t0, off: false, strikes: 0, stats: (0, 0, None), times: (0.0, 0.0, 0.0) }));
+             ck.level_end = ck.head;
+         }
+     }
+@@ -1000,6 +1046,7 @@ pub fn finish(ck: &mut Checker) {
+             let all: f64 = std::fs::read_dir("/proc/self/task").map(|d| d.flatten().map(|e| cpu(&e.path().join("schedstat"))).sum()).unwrap_or(0.0);
+             eprintln!("par cpu: {:.0} ms main thread, {:.0} ms other threads", main, all - main);
+             eprintln!("par: {} levels, {} of {} states expanded by workers, {} handed back{}", par.stats.0, par.stats.1, ck.head, par.strikes, par.stats.2.as_ref().map_or(String::new(), |w| format!("; stopped: {}", w)));
++            eprintln!("par: states held at most {} MB, levels released: {}", par.held_max >> 20, par.release);
+             eprintln!("par times: {:.0} ms before, {:.0} ms workers, {:.0} ms merge, {:.0} ms total", par.times.0, par.times.1, par.times.2, ck.ev.host.borrow().now_ms() - par.t0);
+         }
+         par.engine = None;
+@@ -1012,17 +1059,31 @@ pub fn finish(ck: &mut Checker) {
+ }
+ 
+ impl Par {
+-    /// State `i`, which the parallel search found.
+-    pub fn load(&self, i: usize, nvars: usize) -> StateRef {
++    /// State `i`, which the parallel search found; None when its batch was released.
++    pub fn load(&self, i: usize, nvars: usize) -> Option<StateRef> {
+         let k = self.store.partition_point(|b| b.base <= i) - 1;
+         let b = &self.store[k];
+-        self.de.borrow_mut().state(b.get(i - b.base), nvars)
++        if b.released() {
++            return None;
++        }
++        Some(self.de.borrow_mut().state(b.get(i - b.base), nvars))
++    }
++    /// Releases the bytes of the batches whose states have all been expanded (all ids below `head`).
++    fn release(&mut self, head: usize) {
++        if !self.release {
++            return;
++        }
++        for b in self.store.iter_mut() {
++            if b.base > 0 && !b.released() && b.base + b.len() <= head {
++                *b = Arc::new(Batch { base: b.base, starts: vec![], segs: vec![], released: true });
++            }
++        }
+     }
+     /// Rebuilds the states from `from` on that exist in serialized form only.
+     fn materialize(&mut self, ck: &mut Checker, from: usize) {
+         for i in from..ck.states.len() {
+             if Rc::ptr_eq(&ck.states[i], &ck.empty) {
+-                ck.states[i] = self.load(i, ck.model.vars.len());
++                ck.states[i] = self.load(i, ck.model.vars.len()).expect("parallel search: a state to rebuild was released");
+             }
+         }
+     }
+@@ -1071,6 +1132,10 @@ impl Par {
+         }
+         true
+     }
++    /// States per wave of a level (EVERYSTATE_PAR_WAVE, default 2^18).
++    fn cfg_wave(&self) -> usize {
++        std::env::var("EVERYSTATE_PAR_WAVE").ok().and_then(|v| v.parse::<usize>().ok()).filter(|w| *w > 0).unwrap_or(1 << 18)
++    }
+     fn chunk(&self, n: usize) -> usize {
+         if self.cfg.chunk > 0 { self.cfg.chunk } else { (n / (self.cfg.workers * 8)).clamp(1, 256) }
+     }
+@@ -1082,12 +1147,14 @@ impl Par {
+             return 0;
+         }
+         let mut f = Batch::new(0);
++        let mut buf = vec![];
+         for s in cands {
+-            if !ser_state(s, nvars, &mut f.bytes) {
++            buf.clear();
++            if !ser_state(s, nvars, &mut buf) {
+                 self.give_up(ck, events, UNSENDABLE);
+                 return 0;
+             }
+-            f.offs.push(f.bytes.len());
++            f.push(&buf);
+         }
+         let frontier = Arc::new(f);
+         let t1 = ck.ev.host.borrow().now_ms();
+@@ -1097,7 +1164,7 @@ impl Par {
+         let chunk = self.chunk(n);
+         let eng = self.engine.as_mut().unwrap();
+         std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
+-        let (chunks, stop) = eng.run(true, frontier.clone(), 1, chunk);
++        let (chunks, stop) = eng.run(true, frontier.clone(), 0, n, 1, chunk);
+         let eng = self.engine.as_mut().unwrap();
+         std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
+         let t2 = ck.ev.host.borrow().now_ms();
+@@ -1141,8 +1208,7 @@ impl Par {
+                     }
+                     ck.depth = ck.depth.max(1);
+                     ck.init_distinct += 1;
+-                    found.bytes.extend_from_slice(frontier.get(c.start + k));
+-                    found.offs.push(found.bytes.len());
++                    found.push(frontier.get(c.start + k));
+                 }
+             }
+             pos += upto;
+@@ -1174,6 +1240,10 @@ impl Par {
+ 
+     fn level(&mut self, ck: &mut Checker, events: &mut dyn Events) -> bool {
+         let (a, b) = (ck.head, ck.states.len());
++        self.release(a);
++        if std::env::var_os("EVERYSTATE_PAR_DEBUG").is_some() {
++            self.held_max = self.held_max.max(self.store.iter().map(|b| b.held()).sum());
++        }
+         let n = b - a;
+         let nvars = ck.model.vars.len();
+         if !self.ready(ck, events, n) {
+@@ -1186,95 +1256,108 @@ impl Par {
+             Some(f) if f.base == a && f.len() == n => f,
+             _ => {
+                 let mut f = Batch::new(a);
++                let mut buf = vec![];
+                 for i in a..b {
+-                    if !ser_state(&ck.states[i], nvars, &mut f.bytes) {
++                    buf.clear();
++                    if !ser_state(&ck.states[i], nvars, &mut buf) {
+                         self.give_up(ck, events, UNSENDABLE);
+                         return false;
+                     }
+-                    f.offs.push(f.bytes.len());
++                    f.push(&buf);
+                 }
+                 Arc::new(f)
+             }
+         };
+         let lvl = ck.level[a];
+         let chunk = self.chunk(n);
+-        let t1 = ck.ev.host.borrow().now_ms();
+         if self.stats.0 == 0 && self.times.0 == 0.0 {
+-            self.times.0 = t1 - self.t0;
++            self.times.0 = ck.ev.host.borrow().now_ms() - self.t0;
+         }
+-        let eng = self.engine.as_mut().unwrap();
+-        // the workers read the fingerprint set while they run; nobody writes
+-        std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
+-        let (chunks, stop) = eng.run(false, frontier, lvl, chunk);
+-        let eng = self.engine.as_mut().unwrap();
+-        std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
+-
+-        let t2 = ck.ev.host.borrow().now_ms();
+-        self.times.1 += t2 - t1;
+-        // merge, in state order, everything before the first state a worker stopped at
+-        let p = stop.min(n);
++        // The level goes to the workers in waves of `wave` states, each merged before the next one
++        // starts: what the workers report for a wave is held only until it is merged. A later wave finds
++        // the states of the earlier ones in the fingerprint set; it reports them as known, with their ids.
++        let wave = self.cfg_wave();
+         let record = ck.opts.record_graph;
+         let mut found = Batch::new(b);
+         let mut pos = 0;
++        let mut p = n;
+         let mut event: Option<Event> = None;
+-        for c in chunks {
+-            if c.start + c.done == p && c.event.is_some() {
+-                event = c.event;
+-            }
+-            if c.start >= p {
+-                continue;
+-            }
+-            assert_eq!(c.start, pos, "parallel search: a part of the level is missing");
+-            let upto = c.done.min(p - c.start);
+-            let (mut ei, mut boff) = (0, 0);
+-            for k in 0..upto {
+-                let sid = a + c.start + k;
+-                let (generated, entries) = c.src[k];
+-                ck.generated += generated;
+-                let mut fresh = 0u32;
+-                for _ in 0..entries {
+-                    let e = &c.ent[ei];
+-                    ei += 1;
+-                    let bytes = &c.bytes[boff..boff + e.len as usize];
+-                    boff += e.len as usize;
+-                    let id = match e.kind {
+-                        CAND => {
+-                            let nid = ck.states.len() as u32;
+-                            match ck.fps.put(e.fp, nid) {
+-                                None => {
+-                                    ck.states.push(ck.empty.clone());
+-                                    ck.parent.push(sid as u32);
+-                                    ck.level.push(lvl + 1);
+-                                    ck.act.push(e.act as i32);
+-                                    if record {
+-                                        ck.succ.push(vec![]);
+-                                        ck.succ_act.push(vec![]);
+-                                        if let Some(ss) = &mut ck.succ_state {
+-                                            ss.push(vec![]);
++        while pos < n {
++            let hi = (pos + wave).min(n);
++            let t1 = ck.ev.host.borrow().now_ms();
++            let eng = self.engine.as_mut().unwrap();
++            // the workers read the fingerprint set while they run; nobody writes
++            std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
++            let (chunks, stop) = eng.run(false, frontier.clone(), pos, hi, lvl, chunk);
++            let eng = self.engine.as_mut().unwrap();
++            std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
++            let t2 = ck.ev.host.borrow().now_ms();
++            self.times.1 += t2 - t1;
++            // merge, in state order, everything before the first state a worker stopped at
++            let wp = stop.min(hi);
++            for c in chunks {
++                if c.start + c.done == wp && c.event.is_some() {
++                    event = c.event;
++                }
++                if c.start >= wp {
++                    continue;
++                }
++                assert_eq!(c.start, pos, "parallel search: a part of the level is missing");
++                let upto = c.done.min(wp - c.start);
++                let (mut ei, mut boff) = (0, 0);
++                for k in 0..upto {
++                    let sid = a + c.start + k;
++                    let (generated, entries) = c.src[k];
++                    ck.generated += generated;
++                    let mut fresh = 0u32;
++                    for _ in 0..entries {
++                        let e = &c.ent[ei];
++                        ei += 1;
++                        let bytes = &c.bytes[boff..boff + e.len as usize];
++                        boff += e.len as usize;
++                        let id = match e.kind {
++                            CAND => {
++                                let nid = ck.states.len() as u32;
++                                match ck.fps.put(e.fp, nid) {
++                                    None => {
++                                        ck.states.push(ck.empty.clone());
++                                        ck.parent.push(sid as u32);
++                                        ck.level.push(lvl + 1);
++                                        ck.act.push(e.act as i32);
++                                        if record {
++                                            ck.succ.push(vec![]);
++                                            ck.succ_act.push(vec![]);
++                                            if let Some(ss) = &mut ck.succ_state {
++                                                ss.push(vec![]);
++                                            }
+                                         }
++                                        found.push(bytes);
++                                        fresh += 1;
++                                        nid
+                                     }
+-                                    found.bytes.extend_from_slice(bytes);
+-                                    found.offs.push(found.bytes.len());
+-                                    fresh += 1;
+-                                    nid
++                                    Some(ex) => ex,
+                                 }
+-                                Some(ex) => ex,
+                             }
+-                        }
+-                        DUP => ck.fps.get(e.fp).expect("parallel search: a duplicate without its original"),
+-                        _ => e.fp as u32,
+-                    };
+-                    if record {
+-                        ck.succ[sid].push(id);
+-                        ck.succ_act[sid].push(e.act);
+-                        if let Some(ss) = &mut ck.succ_state {
+-                            ss[sid].push(self.de.borrow_mut().state(bytes, nvars));
++                            DUP => ck.fps.get(e.fp).expect("parallel search: a duplicate without its original"),
++                            _ => e.fp as u32,
++                        };
++                        if record {
++                            ck.succ[sid].push(id);
++                            ck.succ_act[sid].push(e.act);
++                            if let Some(ss) = &mut ck.succ_state {
++                                ss[sid].push(self.de.borrow_mut().state(bytes, nvars));
++                            }
+                         }
+                     }
++                    ck.outdeg.push(fresh);
+                 }
+-                ck.outdeg.push(fresh);
++                pos += upto;
++            }
++            self.times.2 += ck.ev.host.borrow().now_ms() - t2;
++            if wp < hi {
++                p = wp;
++                break;
+             }
+-            pos += upto;
+         }
+         assert_eq!(pos, p, "parallel search: a part of the level is missing");
+         debug_assert!(NO_PARENT as usize > ck.states.len());
+@@ -1282,7 +1365,6 @@ impl Par {
+         ck.cur_level = lvl;
+         self.stats.0 += 1;
+         self.stats.1 += p as u64;
+-        self.times.2 += ck.ev.host.borrow().now_ms() - t2;
+         let complete = p == n;
+         if found.len() > 0 {
+             ck.depth = ck.depth.max(lvl + 1);
+diff --git a/test/workers.mjs b/test/workers.mjs
+index fd15d22..84ed68b 100644
+--- a/test/workers.mjs
++++ b/test/workers.mjs
+@@ -1,7 +1,9 @@
+ // `-workers N` against `-workers 1` on test/workers/Base.tla: for every configuration below the complete
+ // output (TLC text and -tool framing, the -json line, the `-dump dot` graph and the exit status) must be
+ // the same, apart from the banner's worker count, times, and the one line that says the search went
+-// back to one worker. Each case also states whether states have to be handed back to the sequential
++// back to one worker. Every case runs with and without -dump: without it, the parallel search releases
++// the levels it has expanded and rebuilds the states of a trace by expanding their parents again (see
++// src/par.rs); that trace must be the same too. Each case also states whether states have to be handed back to the sequential
+ // search because of an order-dependent operator (and with which reason, when that happens for good).
+ //
+ // usage: node test/workers.mjs [--workers 4] [--bin path/to/everystate] [--repeat 3]
+@@ -52,7 +54,7 @@ const NOTE = /^The search continues with 1 worker instead of \d+: (.*)\n/m;
+ const DEBUG = /^par(?: cpu| times)?: .*\n/mg, BACK = /states expanded by workers, (\d+) handed back/;
+ const norm = s => s.replace(/\d{4}-\d\d-\d\d \d\d:\d\d:\d\d/g, 'T').replace(/with \d+ workers? on \d+ cores/, 'with W').replace(/Finished in \d+\w*( \d+\w+)?/, 'Finished in')
+   .replace(/\(([\d,]+) s\/min\)|\(([\d,]+) ds\/min\)/g, '(R)').replace(NOTE, '').replace(DEBUG, '');
+-function run(cfg, w, flags, par) {
++function run(cfg, w, flags, par, dump) {
+   const env = { ...process.env };
+   delete env.EVERYSTATE_PAR_MIN; delete env.EVERYSTATE_PAR_CHUNK;
+   delete env.EVERYSTATE_PAR_DEBUG;
+@@ -60,7 +62,7 @@ function run(cfg, w, flags, par) {
+   if (par) { env.EVERYSTATE_PAR_MIN = '1'; env.EVERYSTATE_PAR_CHUNK = par; }
+   const dot = path.join(tmp, 'g.dot');
+   fs.rmSync(dot, { force: true });
+-  const r = spawnSync(bin, ['-workers', String(w), ...flags, '-dump', 'dot,actionlabels', dot, '-config', cfg, spec], { encoding: 'utf8', env, maxBuffer: 1 << 28 });
++  const r = spawnSync(bin, ['-workers', String(w), ...flags, ...(dump ? ['-dump', 'dot,actionlabels', dot] : []), '-config', cfg, spec], { encoding: 'utf8', env, maxBuffer: 1 << 28 });
+   const out = (r.stdout ?? '') + (r.stderr ?? '');
+   return { code: r.status, out: norm(out), note: NOTE.exec(out)?.[1] ?? '', back: Number(BACK.exec(out)?.[1] ?? 0), graph: fs.existsSync(dot) ? fs.readFileSync(dot, 'utf8') : '' };
+ }
+@@ -69,12 +71,12 @@ for (const [name, lines, exit, fallback] of cases) {
+   const cfg = path.join(tmp, name + '.cfg');
+   fs.writeFileSync(cfg, lines.join('\n') + '\n');
+   const problems = [];
+-  for (const flags of [[], ['-tool'], ['-json']]) {
+-    const a = run(cfg, 1, flags, null);
++  for (const [flags, dump] of [[[], true], [['-tool'], true], [['-json'], true], [[], false], [['-tool'], false]]) {
++    const a = run(cfg, 1, flags, null, dump);
+     if (a.code !== exit) problems.push(`${flags[0] ?? 'text'}: exit ${a.code}, expected ${exit}`);
+     for (let k = 0; k < repeat; k++) {
+-      const b = run(cfg, workers, flags, ['1', '3', ''][k % 3]);
+-      const what = `${flags[0] ?? 'text'} run ${k + 1}`;
++      const b = run(cfg, workers, flags, ['1', '3', ''][k % 3], dump);
++      const what = `${flags[0] ?? 'text'}${dump ? '' : ' (no -dump)'} run ${k + 1}`;
+       if (b.code !== a.code) problems.push(`${what}: exit ${b.code} != ${a.code}`);
+       else if (b.out !== a.out) problems.push(`${what}: output differs`);
+       else if (b.graph !== a.graph) problems.push(`${what}: state graph differs`);

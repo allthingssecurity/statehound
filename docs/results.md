@@ -92,3 +92,41 @@ A small A/B test re-ran the original confirmation prompt of two findings, each w
 shared "confirmation kit" (exact skill location, a prebuilt pristine module and its classpath). On the
 one usable pair, the kit cut wall time 26 % (7.3 → 5.4 min) and tool calls 35 % (40 → 26) at equal cost
 and the same verdict. That is a single pair, so it shows the direction, not the size.
+
+## 6. Engine memory and the compiled evaluator (patch 0004)
+
+Following the measure-first workflow of [Max Woolf's optimisation passes](https://minimaxir.com/2026/11/opus-fable/)
+(profile, then a peak-memory pass, then a speed pass, each gated on no regressions), on the checks that
+Statehound audits actually run (7 checks from Camel audits, `-workers 3 -deadlock`, peak RSS from `time -l`):
+
+| check | distinct states | time before → after | peak memory before → after |
+|---|---:|---:|---:|
+| redelivery takeover | 32,979,081 | 157.8 s → 98.4 s (1.60x) | 12.6 GB → 5.4 GB (2.3x) |
+| eventhubs checkpoint | 4,020,855 | 10.6 s → 8.3 s (1.27x) | 1.30 GB → 0.68 GB (1.9x) |
+| supervising restart | 5,506,119 | 19.1 s → 17.4 s (1.10x) | 1.84 GB → 0.88 GB (2.1x) |
+| sjms recovery (safety) | 2,877,926 | 11.5 s → 10.5 s (1.10x) | 1.20 GB → 0.43 GB (2.8x) |
+| netty, s3, sjms (liveness) | 0.5–3.0 M | unchanged | unchanged |
+
+What the profile showed and what changed:
+
+- **Memory.** 86% of the peak was the serialized copy of every state found, kept for counterexamples; at the
+  peak level the merge also held every worker's report for the whole level (3.8 GB). Now a level's states are
+  released once it has been expanded and a trace state is rebuilt as TLC rebuilds one (expand the parent,
+  take the successor with its action and fingerprint); levels go to the workers in waves of 2^18 states;
+  batches live in fixed segments instead of doubling buffers. Not with liveness, `-dump`, the debugger,
+  VIEW or SYMMETRY (they read the states again); `EVERYSTATE_KEEP_STATES=1` keeps everything.
+- **Speed.** All three workers were busy; the time was evaluation. Agent-written `TypeOK`s
+  (`f \in [S \X T -> BOOLEAN]`, `s \subseteq S`) fell back to the tree-walker 13 times per state, which
+  switched the compiled plan off altogether, and so did `A => B` inside actions. Closed constant
+  sub-expressions are now computed once per worker, `\subseteq` is compiled, and implications/inclusions
+  that cannot prime anything are compiled as conditions. On the redelivery spec, tree-walker evaluations
+  went from 535,369 to 0 and fallbacks from 466,813 to 236 (small configuration).
+
+Correctness (new against the 0.4.1 + 0001–0003 engine, output compared byte for byte apart from times):
+264/264 audit checks with `-workers 3` (parallel forced on every level, waves of 64), 264/264 with
+`-workers 1`, 264/264 with `EVERYSTATE_STEP_CACHE=always` (132 invariant violations, 43 deadlocks, 23 liveness
+violations among them; 66 of the violating checks rebuilt released trace states); 99/99 corpus jobs with
+`-workers 3`; 297/297 against upstream everystate 0.4.1 (`-simulate`, `-workers 1`, `-tool`) apart from the
+depth in the once-a-minute `Progress` line of the 3 longest jobs, which are now further along; node tests
+57/57, community 21/21, multi-worker checks 27/27 (now also run without `-dump`, so that traces go through
+the rebuild).
